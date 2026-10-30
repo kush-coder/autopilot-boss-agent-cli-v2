@@ -1,0 +1,245 @@
+"""Schema 合约测试 + 错误码一致性测试。
+
+确保 `boss schema` 输出的命令列表与 main.py 中注册的命令完全一致，
+并验证代码中使用的每个错误码都在 schema 中声明。
+"""
+
+import json
+
+from click.testing import CliRunner
+
+from boss_agent_cli.main import cli
+from boss_agent_cli.schema.data import SCHEMA_DATA
+
+
+# ── Schema 输出格式 ─────────────────────────────────────────────────
+
+
+def test_schema_output_is_json_envelope():
+	"""schema 输出应为标准 JSON 信封格式，包含必要顶层字段。"""
+	runner = CliRunner()
+	result = runner.invoke(cli, ["schema"])
+	assert result.exit_code == 0
+
+	parsed = json.loads(result.output)
+
+	# 信封顶层字段
+	assert parsed["ok"] is True
+	assert parsed["schema_version"] == "1.0"
+	assert parsed["command"] == "schema"
+	assert parsed["error"] is None
+
+	# data 子结构
+	data = parsed["data"]
+	assert "commands" in data
+	assert "error_codes" in data
+	assert "conventions" in data
+	assert "global_options" in data
+	assert isinstance(data["commands"], dict)
+	assert isinstance(data["error_codes"], dict)
+
+
+# ── 双受众信封契约 ──────────────────────────────────────────────────
+
+
+def test_schema_conventions_declare_hints_audiences():
+	"""conventions 必须声明 next_actions / operator_actions 各自的受众。"""
+	hints = SCHEMA_DATA["conventions"]["hints"]
+	assert set(hints) == {"next_actions", "operator_actions"}
+	assert "Agent" in hints["next_actions"]
+	assert "操作者" in hints["operator_actions"]
+
+
+def test_schema_conventions_declare_command_vs_wizard():
+	"""commands 与 wizard_catalog 是两套并行能力面，必须声明何时用哪个。"""
+	declaration = SCHEMA_DATA["conventions"]["command_vs_wizard"]
+	assert "顶层命令" in declaration
+	assert "wizard" in declaration
+
+
+# ── Schema 命令集 == 注册命令集 ─────────────────────────────────────
+
+
+def test_schema_commands_match_registered():
+	"""schema 中声明的命令集合应等于 main.py 中注册的所有顶层命令。"""
+	# 从 CLI group 获取已注册命令名
+	registered = set(cli.commands.keys())
+
+	# 从 schema 获取声明命令名
+	schema_commands = set(SCHEMA_DATA["commands"].keys())
+
+	missing_in_schema = registered - schema_commands
+	extra_in_schema = schema_commands - registered
+
+	assert not missing_in_schema, (
+		f"以下命令已注册但未在 schema 中声明: {missing_in_schema}"
+	)
+	assert not extra_in_schema, (
+		f"以下命令在 schema 中声明但未注册: {extra_in_schema}"
+	)
+
+
+# ── 每个命令都有描述 ────────────────────────────────────────────────
+
+
+def test_schema_commands_have_descriptions():
+	"""schema 中每个命令都应有非空的 description 字段。"""
+	commands = SCHEMA_DATA["commands"]
+	missing = []
+	for name, spec in commands.items():
+		desc = spec.get("description", "")
+		if not desc or not desc.strip():
+			missing.append(name)
+
+	assert not missing, (
+		f"以下命令缺少 description: {missing}"
+	)
+
+
+def test_doctor_schema_documents_cdp_risk_boundary():
+	"""doctor schema 只描述保留的 CDP 通道，不提供风控绕过入口。"""
+	description = SCHEMA_DATA["commands"]["doctor"]["description"]
+	assert "CDP" in description
+	assert "Bridge" not in description
+	assert "浏览器桥" not in description
+	assert "不得用于规避平台风控" in description
+
+
+def test_browser_source_schema_only_describes_supported_channels():
+	description = SCHEMA_DATA["global_options"]["--browser-source"]["description"]
+	assert "Bridge" not in description
+	assert "CDP" in description
+	assert "headless" in description
+	assert "BROWSER_SESSION_NOT_FOUND" in description
+	assert "CDP_UNAVAILABLE" in description
+
+
+# ── 错误码一致性 ────────────────────────────────────────────────────
+
+
+def test_schema_error_codes_cover_all_used_codes():
+	"""代码中实际使用的错误码应全部在 schema error_codes 中声明。
+
+	已知例外:
+	- HOOK_BLOCKED: 仅在启用钩子系统时出现，属于扩展机制，不在公开 schema 中声明。
+	"""
+	schema_codes = set(SCHEMA_DATA["error_codes"].keys())
+
+	# 代码中实际使用的所有错误码（通过审计收集）
+	used_codes = {
+		"CONFIRMATION_REQUIRED",
+		"RESUME_ACCEPT_RESULT_UNKNOWN",
+		"GREET_RESULT_UNKNOWN",
+		"ACTION_UNCONFIRMED",
+		"EXCHANGE_NOT_AVAILABLE",
+		"AUTH_EXPIRED",
+		"AUTH_REQUIRED",
+		"RATE_LIMITED",
+		"TOKEN_REFRESH_FAILED",
+		"ENVIRONMENT_RISK",
+		"LOGIN_TIMEOUT",
+		"CDP_UNAVAILABLE",
+		"BROWSER_SESSION_NOT_FOUND",
+		"BROWSER_KERNEL_MISSING",
+		"BROWSER_NAV_TIMEOUT",
+		"LOGIN_RISK_CONTROL",
+		"LOGIN_EXPIRED",
+		"LOGIN_CREDENTIAL_EXTRACTION_FAILED",
+		"ACCOUNT_RISK",
+		"JOB_NOT_FOUND",
+		"ALREADY_GREETED",
+		"ALREADY_APPLIED",
+		"GREET_LIMIT",
+		"NETWORK_ERROR",
+		"INVALID_PARAM",
+		"NOT_SUPPORTED",
+		"COMPLIANCE_BLOCKED",
+		"HOOK_BLOCKED",
+	}
+
+	# HOOK_BLOCKED 是内部扩展机制，允许不在公开 schema 中
+	allowed_internal = {"HOOK_BLOCKED"}
+	must_be_in_schema = used_codes - allowed_internal
+
+	missing = must_be_in_schema - schema_codes
+	assert not missing, (
+		f"以下错误码在代码中使用但未在 schema 中声明: {missing}"
+	)
+
+
+def test_schema_error_codes_all_have_message():
+	"""schema 中每个错误码都应有非空的 message 字段。"""
+	error_codes = SCHEMA_DATA["error_codes"]
+	missing = []
+	for code, spec in error_codes.items():
+		msg = spec.get("message", "")
+		if not msg or not msg.strip():
+			missing.append(code)
+
+	assert not missing, (
+		f"以下错误码缺少 message: {missing}"
+	)
+
+
+def test_schema_error_codes_have_recoverable_field():
+	"""schema 中每个错误码都应声明 recoverable 字段。"""
+	error_codes = SCHEMA_DATA["error_codes"]
+	missing = []
+	for code, spec in error_codes.items():
+		if "recoverable" not in spec:
+			missing.append(code)
+
+	assert not missing, (
+		f"以下错误码缺少 recoverable 字段: {missing}"
+	)
+
+
+def test_schema_error_codes_have_recovery_action_field():
+	"""schema 中每个错误码都应显式声明 recovery_action 字段。"""
+	error_codes = SCHEMA_DATA["error_codes"]
+	missing = []
+	for code, spec in error_codes.items():
+		if "recovery_action" not in spec:
+			missing.append(code)
+
+	assert not missing, (
+		f"以下错误码缺少 recovery_action 字段: {missing}"
+	)
+
+
+def test_search_schema_keeps_welfare_option():
+	"""--welfare 是核心差异化能力，必须保留在 search schema 中。"""
+	welfare = SCHEMA_DATA["commands"]["search"]["options"]["--welfare"]
+	assert welfare["type"] == "string"
+	assert "福利筛选" in welfare["description"]
+
+
+def test_schema_exposes_recruiter_chat_context_commands():
+	"""招聘者沟通上下文命令必须进入 boss schema 能力真源。"""
+	subcommands = SCHEMA_DATA["commands"]["hr"]["subcommands"]
+	assert "chatmsg" in subcommands
+	assert "last-messages" in subcommands
+
+
+def test_schema_environment_risk_is_terminal():
+	"""ENVIRONMENT_RISK 必须是不可恢复的终止分支，恢复动作指向停止自动化。"""
+	spec = SCHEMA_DATA["error_codes"]["ENVIRONMENT_RISK"]
+	assert spec["recoverable"] is False
+	assert spec["recovery_action"] == "停止自动化访问；保留原会话，在官方目标业务页确认风险解除后，由用户执行 boss clean --risk-lock 并显式恢复任务，降低访问频率"
+	assert spec["message"] == "访问环境存在异常"
+
+
+def test_schema_documents_browser_source_flag():
+	"""--browser-source 必须进入 schema global_options，choices 覆盖全部来源且标 experimental。"""
+	flag = SCHEMA_DATA["global_options"]["--browser-source"]
+	assert sorted(flag["choices"]) == ["auto", "existing-browser", "httpx-only", "stored-cookie"]
+	# choices 只从策略表推导（顺序亦同）：策略表加一行，schema / CLI / MCP 三处同时看到，不会漂移
+	from boss_agent_cli.api.browser_source import POLICIES
+
+	assert flag["choices"] == list(POLICIES)
+	assert "BROWSER_SESSION_NOT_FOUND" in flag["description"]
+	assert "CDP_UNAVAILABLE" in flag["description"]
+	assert "httpx-only" in flag["description"]
+	assert "BROWSER_DISABLED" in flag["description"]
+	assert flag["default"] == "auto"
+	assert flag["stability"] == "experimental"

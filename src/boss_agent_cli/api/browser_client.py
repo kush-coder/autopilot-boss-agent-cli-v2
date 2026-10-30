@@ -1,0 +1,1336 @@
+"""Browser-based platform client for user-triggered browser flows.
+
+Requests use the selected browser's existing session. Business operation metadata
+controls replay, and platform risk stops the workflow instead of switching channels.
+Fetch, response-body and renderer evaluation have bounded deadlines.
+
+Supports two modes:
+  1. CDP mode: connects to user's existing Chrome via DevTools Protocol
+  2. Patchright mode (fallback): launches a headless Chromium instance
+"""
+
+import base64
+import json
+import sys
+import time
+from pathlib import Path
+from types import TracebackType
+from typing import Any, Callable, Mapping, cast
+from patchright.sync_api import sync_playwright
+
+from boss_agent_cli.config import DEFAULT_REQUEST_DELAY
+from boss_agent_cli.api import endpoints
+from boss_agent_cli.api.browser_source import (
+	CHANNEL_CDP,
+	CHANNEL_HEADLESS,
+	BrowserSourcePolicy,
+	BrowserSourceUnavailable,
+	resolve_policy,
+)
+from boss_agent_cli.api.proxy import WEBRTC_LEAK_GUARD_ARGS, resolve_proxy
+from boss_agent_cli.api.browser_urls import DEFAULT_CDP_URL, is_zhipin_url
+from boss_agent_cli.api.endpoints_loader import EndpointSpec, endpoint_for_request
+from boss_agent_cli.api.httpx_helpers import new_trace_id
+from boss_agent_cli.api.throttle import RequestThrottle
+from boss_agent_cli.api.request_budget import RequestBudget, check_request_control, is_request_stop, retry_after_seconds
+from boss_agent_cli.api.zhipin_errors import platform_risk_page_response, raise_platform_risk_response
+
+HOME_URL = "https://www.zhipin.com/"
+
+# is_zhipin_url 来自 api.browser_urls 的精确 hostname 校验（单一实现，避免多处漂移）。
+
+
+def _find_reusable_zhipin_page(context: Any) -> Any | None:
+	"""在用户 context 已打开的页面里找第一个 zhipin 页复用，找不到返回 None。"""
+	for page in getattr(context, "pages", None) or []:
+		if is_zhipin_url(getattr(page, "url", "")):
+			return page
+	return None
+
+
+class BrowserNavigationError(RuntimeError):
+	"""首页在有界重试后仍未进入 domcontentloaded。
+
+	用户可见文案不转发 Playwright 的 ``Page.goto`` 调用日志。``details()`` 只保留
+	公开 URL、次数、通道和原因的第一行，供信封诊断。
+	"""
+
+	code = "BROWSER_NAV_TIMEOUT"
+
+	def __init__(
+		self,
+		url: str,
+		*,
+		attempts: int,
+		timeout_ms: int,
+		channel: str,
+		cause: BaseException | None = None,
+	) -> None:
+		self.url = url
+		self.attempts = attempts
+		self.timeout_ms = timeout_ms
+		self.channel = channel
+		self.cause = cause
+		super().__init__(
+			f"浏览器首页导航超时：连续 {attempts} 次均未在 {timeout_ms}ms 内到达 domcontentloaded（{url}）"
+		)
+
+	def details(self) -> dict[str, Any]:
+		cause_text = ""
+		if self.cause is not None:
+			cause_text = str(self.cause).splitlines()[0][:240]
+		payload: dict[str, Any] = {
+			"url": self.url,
+			"attempts": self.attempts,
+			"timeout_ms": self.timeout_ms,
+			"channel": self.channel,
+		}
+		if cause_text:
+			payload["cause"] = cause_text
+		return payload
+
+
+class RecruiterChatTabRequired(RuntimeError):
+	"""招聘者操作（issue #217 修复路径）需要用户已打开 chat/index 页。
+
+	不自动新开 tab：避免替用户改变官方页面状态或触发额外平台风险信号。
+	友好做法是返回明确指引，让用户自己打开。
+	"""
+
+	def __init__(self) -> None:
+		super().__init__(
+			"recruiter chat tab not found in CDP Chrome — "
+			"please open https://www.zhipin.com/web/chat/index in your "
+			"Chrome (CDP-attached) and retry."
+		)
+
+
+# 超时常量
+_CDP_PROBE_TIMEOUT = 3  # 显式 --cdp-url 的 CDP 探测 HTTP 超时（秒）
+_CDP_AUTO_PROBE_TIMEOUT = 1  # 默认自动探测 localhost:9222 的超时（无调试端口时快速失败，省 ~2s）
+_NAV_TIMEOUT_MS = 15000  # 页面导航超时（毫秒）
+# 含首次。与 auth.browser._HOME_NAV_RETRIES 对齐：首页在自动化下偶发卡住，
+# 跳 about:blank 重置卡死导航后再试一次（Discussion #250）。
+_HOME_NAV_RETRIES = 2
+# zhipin 首页常驻请求多、headless 下基本进不了 networkidle；domcontentloaded 后 JS
+# 环境即可发 fetch，故宽限缩到 0.8s（实测每次都会耗满，缩短直接省 ~2s/搜索）。
+_HEADLESS_NETWORKIDLE_GRACE_MS = 800
+_REQUEST_TIMEOUT_MS = 20000
+# zhipin 的主登录态 cookie：同一账号值稳定、不同账号不同，用于判定复用到的浏览器
+# 属于哪个账号（与 auth/login 的「账号指纹」同源）。
+_PRIMARY_COOKIE = "wt2"
+_PRIMARY_COOKIE_DOMAIN = ".zhipin.com"
+
+
+def _cookie_domain_matches(cookie_domain: str, expected: str) -> bool:
+	"""cookie domain 是否落在 expected 上（忽略前导点与大小写）。"""
+	left = (cookie_domain or "").lstrip(".").lower()
+	right = (expected or "").lstrip(".").lower()
+	if not left or not right:
+		return False
+	return left == right or left.endswith("." + right)
+_EVALUATE_TIMEOUT_MS = 30000
+
+# macOS / Linux / Windows Chrome user data 默认路径
+_CHROME_USER_DATA_CANDIDATES = [
+	Path.home() / "Library/Application Support/Google/Chrome",  # macOS
+	Path.home() / ".config/google-chrome",  # Linux
+	Path.home() / "AppData/Local/Google/Chrome/User Data",  # Windows
+]
+
+
+#: Runtime.evaluate(fetch) 的 JS 主体，request() 首次与只读恢复共用同一份。
+_FETCH_SCRIPT = r"""
+			async ({method, url, params, data, referer, timeoutMs, identity, traceId}) => {
+				const controller = new AbortController();
+				let timer;
+				const deadline = new Promise((_, reject) => {
+					timer = setTimeout(() => {
+						controller.abort();
+						reject(new Error('browser request deadline exceeded'));
+					}, timeoutMs);
+				});
+				try {
+					return await Promise.race([deadline, (async () => {
+					let fetchUrl = url;
+					if (params && Object.keys(params).length > 0) {
+						const sp = new URLSearchParams();
+						for (const [k, v] of Object.entries(params)) {
+							if (v !== null && v !== undefined) sp.append(k, String(v));
+						}
+						fetchUrl = url + '?' + sp.toString();
+					}
+
+					const options = {
+						method: method,
+						signal: controller.signal,
+						credentials: 'include',
+						headers: Object.assign({
+							'Accept': 'application/json, text/plain, */*',
+							'Referer': referer,
+							'X-Requested-With': 'XMLHttpRequest',
+							'traceid': traceId,
+						}, identity || {}),
+					};
+
+					if (method === 'POST' && data) {
+						options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+						const formData = new URLSearchParams();
+						for (const [k, v] of Object.entries(data)) {
+							formData.append(k, String(v));
+						}
+						options.body = formData.toString();
+					}
+
+					const resp = await fetch(fetchUrl, options);
+					if (resp.status === 403) {
+						controller.abort();
+						return {code: 36, message: 'HTTP 403 forbidden; workflow stopped', zpData: {}, __cli_platform_code__: null,
+							__cli_security_response__: {url: resp.url, content_type: resp.headers.get('Content-Type') || '', title: ''}};
+					}
+					if (resp.status === 429) {
+						controller.abort();
+						return {code: 9, message: 'HTTP 429 rate limited', zpData: {},
+							__cli_rate_limit__: {retry_after: resp.headers.get('Retry-After') || ''}};
+					}
+					const body = await resp.text();
+					try {
+						const result = JSON.parse(body);
+						if (result && (result.code === 9 || result.code === '9')) {
+							result.__cli_rate_limit__ = {retry_after: resp.headers.get('Retry-After') || ''};
+						}
+						return result;
+					} catch (e) {
+						const title = (body.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+						const restricted = /<h[1-3]\b[^>]*>\s*访问受限\s*<\/h[1-3]\s*>/i.test(body)
+							&& /异常行为|违规访问|暂时被禁止访问/.test(body);
+						const contentType = resp.headers.get('Content-Type') || '';
+						const isHtml = /html/i.test(contentType) || /^\s*(?:<!doctype html|<html)/i.test(body);
+						return {code: -1, message: 'browser response is not JSON', zpData: {},
+							__cli_security_response__: {url: resp.url, content_type: isHtml ? 'text/html' : contentType, title, restricted}};
+					}
+					})()]);
+				} catch (e) {
+					return {code: -1, message: 'browser request interrupted', zpData: {},
+						__cli_request_interrupted__: true};
+				} finally {
+					clearTimeout(timer);
+				}
+			}
+		"""
+
+_CONTEXT_DESTROYED_MARKERS = (
+	"execution context was destroyed",
+	"execution context is not available",
+	"cannot find context with specified id",
+	"target closed",
+)
+
+
+def _is_context_destroyed_error(exc: BaseException) -> bool:
+	"""页面在 evaluate 期间发生导航/重载时 patchright 抛出的那一类错误。"""
+	text = str(exc).lower()
+	return any(marker in text for marker in _CONTEXT_DESTROYED_MARKERS)
+
+
+class BrowserSession:
+	"""Persistent browser session that makes API calls via bounded Chromium evaluation.
+
+	Tries CDP connection to user's Chrome first; falls back to headless patchright.
+	"""
+
+	def __init__(
+		self,
+		cookies: dict[str, Any],
+		user_agent: str,
+		*,
+		delay: tuple[float, float] = DEFAULT_REQUEST_DELAY,
+		cdp_url: str | None = None,
+		logger: Any = None,
+		browser_source: str | None = None,
+		request_budget: RequestBudget | None = None,
+		request_check: Callable[[], None] | None = None,
+		identity: Mapping[str, str] | None = None,
+	) -> None:
+		self._request_budget = request_budget
+		self._request_check = request_check
+		self._throttle = RequestThrottle(delay, check=self._check_request)
+		# patchright 对象运行时创建；注解为 Any 让 mypy 对外部依赖放行
+		self._pw: Any = None
+		self._browser: Any = None
+		self._context: Any = None
+		self._page: Any = None
+		self._cookies = cookies
+		self._user_agent = user_agent
+		self._identity = dict(identity or {})
+		self._started = False
+		self._cdp_url = cdp_url
+		self._is_cdp = False
+		self._own_context = False  # 是否由我们创建的 context（需要在 close 时清理）
+		self._own_page = True  # 是否由我们新建的 page（复用用户已开页签时为 False，close 不关它）
+		# 新建 CDP 页签的 goto 是否真正到达 domcontentloaded。复用页签/headless 路径
+		# 页面已就绪（默认 True）；仅 _try_connect 新建页签 goto 超时才置 False，
+		# request() 据此在 evaluate(fetch) 前做有界恢复，避免对仍在导航的页面挂起。
+		self._page_ready = True
+		self._home_nav_error: BrowserNavigationError | None = None
+		self._logger = logger
+		# 通道来源策略 —— 本类上**唯一**的来源/模式选择器。
+		# 禁止再加第二个模式布尔：那正是 #404 与 #388 各插一个短路、
+		# git 干净自动合并却留下两个互不感知开关的成因（见 browser_source 模块文档）。
+		# 门禁 test_browser_session_has_exactly_one_source_selector 守住这一点。
+		self._policy: BrowserSourcePolicy = resolve_policy(browser_source)
+
+	def _check_request(self) -> None:
+		budget = getattr(self, "_request_budget", None)
+		if budget is not None:
+			budget.check_risk()
+		check = getattr(self, "_request_check", None)
+		if check is not None:
+			check()
+		self._raise_if_security_page()
+
+	def _send_fetch(self, payload: dict[str, Any], endpoint: EndpointSpec | None) -> dict[str, Any]:
+		from contextlib import nullcontext
+
+		budget = getattr(self, "_request_budget", None)
+		window = (
+			budget.attempt("browser-fetch", check=self._check_request, before_wait=self._throttle.wait)
+			if budget is not None
+			else nullcontext()
+		)
+		with window:
+			if budget is None:
+				self._throttle.wait()
+			check_request_control(self._check_request)
+			try:
+				result = self._evaluate_fetch(payload)
+			finally:
+				self._throttle.mark()
+			if isinstance(result, dict):
+				limit = result.pop("__cli_rate_limit__", None)
+				if result.get("code") in (9, "9"):
+					result["code"] = 9
+				if budget is not None and (isinstance(limit, dict) or result.get("code") in (9, "9")):
+					budget.cooldown(
+						max(
+							10.0,
+							retry_after_seconds(limit.get("retry_after") if isinstance(limit, dict) else None) or 0.0,
+						)
+					)
+				security = result.pop("__cli_security_response__", None)
+				if isinstance(security, dict):
+					page_risk = platform_risk_page_response(
+						url=str(security.get("url") or ""),
+						content_type=str(security.get("content_type") or ""),
+						body="<title>访问受限</title>"
+						if security.get("restricted") is True
+						else f"<title>{security.get('title', '')}</title>",
+					)
+					if page_risk is not None:
+						raise_platform_risk_response(page_risk, is_cdp=self._is_cdp)
+				if budget is not None:
+					raise_platform_risk_response(result, is_cdp=self._is_cdp)
+				if result.pop("__cli_request_interrupted__", False):
+					return self._interrupted_request_response(endpoint)
+			return result
+
+	def _navigate_home(self, *, channel: str | None = None) -> None:
+		"""打开首页并确认 domcontentloaded。
+
+		单次 ``goto`` 在 headless / 新建 CDP 页签上会把偶发的首页卡死直接变成
+		``Page.goto`` 超时（Discussion #250）。这里与登录预热一致：失败后先确认
+		不是安全页，再跳 ``about:blank`` 重置导航并重试，全部失败才抛
+		``BrowserNavigationError``。重试留在同一次 browser-navigation 预算窗口里。
+		"""
+		from contextlib import nullcontext
+
+		resolved_channel = channel or ("cdp" if self._is_cdp else "headless")
+		budget = getattr(self, "_request_budget", None)
+		window = (
+			budget.attempt("browser-navigation", check=self._check_request) if budget is not None else nullcontext()
+		)
+		last_error: BaseException | None = None
+		with window:
+			check_request_control(self._check_request)
+			for attempt in range(_HOME_NAV_RETRIES):
+				try:
+					self._page.goto(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+					self._raise_if_security_page()
+					self._home_nav_error = None
+					return
+				except Exception as error:
+					if is_request_stop(error):
+						raise
+					# 超时后页面可能已经停在安全验证页；先抛风险，不要 about:blank 把验证页清掉。
+					self._raise_if_security_page()
+					last_error = error
+					self._log(
+						f"[boss] 首页导航未在预期时间完成（{resolved_channel}，"
+						f"{attempt + 1}/{_HOME_NAV_RETRIES}）：{error}"
+					)
+					if attempt + 1 >= _HOME_NAV_RETRIES:
+						break
+					try:
+						self._page.goto("about:blank", wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+					except Exception as reset_error:
+						if is_request_stop(reset_error):
+							raise
+						self._raise_if_security_page()
+			if last_error is None:
+				last_error = RuntimeError("homepage navigation failed")
+			raise BrowserNavigationError(
+				HOME_URL,
+				attempts=_HOME_NAV_RETRIES,
+				timeout_ms=_NAV_TIMEOUT_MS,
+				channel=resolved_channel,
+				cause=last_error,
+			) from last_error
+
+	def _log(self, message: str) -> None:
+		"""Diagnostic channel logs: debug by default so TTY wizard stays clean."""
+		if self._logger is not None:
+			debug = getattr(self._logger, "debug", None)
+			if callable(debug):
+				debug(message)
+				return
+			info = getattr(self._logger, "info", None)
+			if callable(info):
+				# Only when logger has no debug API — keep quiet if level is error default.
+				info(message)
+				return
+		import os
+
+		if os.environ.get("BOSS_BROWSER_VERBOSE", "").strip() in {"1", "true", "yes", "on"}:
+			print(message, file=sys.stderr)
+
+	def _ensure_started(self) -> None:
+		"""按 policy 声明的通道白名单依次尝试；耗尽即按 policy fail-closed。
+
+		这是**唯一**的通道分发点。禁止在本方法里写 ``if self._policy.name == X``
+		式的策略分支——顺序与准入全部来自 ``policy``，新增来源只加表里一行。
+		门禁 ``test_dispatcher_has_no_policy_name_branch`` 守住这一点。
+		"""
+		if self._started:
+			return
+
+		policy = self._policy
+		attempted: list[str] = []
+		try:
+			for channel in policy.channels:
+				attempted.append(channel)
+				if channel == CHANNEL_CDP:
+					# 惰性起 driver：stored-cookie 这类不含 headless 的来源，
+					# CDP 失败时不该白留一个 playwright driver 进程。
+					self._ensure_playwright()
+					if self._try_cdp():
+						return
+				elif channel == CHANNEL_HEADLESS:
+					self._ensure_playwright()
+					# _start_headless 成功即置 _started，失败抛 playwright 原生异常
+					# 并原样上抛（→ display 兜底 NETWORK_ERROR）。这一支只出现在
+					# auto 的链尾；显式来源不允许此兜底。
+					self._start_headless()
+					return
+				else:  # pragma: no cover - 由门禁 test_every_declared_channel_is_dispatchable 拦住
+					raise ValueError(f"unknown channel {channel!r} in policy {policy.name!r}")
+		except BaseException:
+			# 修既有缺陷：_start_headless / sync_playwright().start() 抛错时
+			# self._pw 已启动却永远不会 stop()，下次 request() 会再起一个 driver 进程。
+			self._release_playwright()
+			raise
+
+		# ── 通道耗尽 ──
+		# auto 到不了这里（headless 支要么 return 要么抛）。
+		self._release_playwright()
+		if not policy.fail_closed:  # pragma: no cover - 防御：非 auto 但没声明 failure_code
+			raise RuntimeError(f"browser source {policy.name!r} exhausted without a failure_code")
+		raise BrowserSourceUnavailable(policy, tuple(attempted))
+
+	def _ensure_playwright(self) -> None:
+		if self._pw is None:
+			self._pw = sync_playwright().start()
+
+	def _release_playwright(self) -> None:
+		if self._pw is not None:
+			try:
+				self._pw.stop()
+			except Exception:
+				pass
+			self._pw = None
+
+	def _try_cdp(self) -> bool:
+		"""Try connecting to user's Chrome via CDP.
+
+		Attempts in order:
+		  1. Explicit cdp_url if provided
+		  2. Default http://localhost:9222 (+ auto WS fallback)   ← 仅当 policy.auto_probe_cdp
+		  3. WebSocket URL from Chrome's DevToolsActivePort file   ← 同上
+
+		``auto_probe_cdp=False`` 的来源只连用户显式给的 ``--cdp-url``，
+		让「指定 CDP」名副其实；没给地址就直接失败，不静默连到别的浏览器。
+		"""
+		policy = self._policy
+		# (url, 是否为用户显式指定) —— 显式与否决定能否新建 context 注入凭据
+		urls_to_try: list[tuple[str, bool]] = []
+		if self._cdp_url:
+			urls_to_try.append((self._cdp_url, True))
+		if policy.auto_probe_cdp:
+			urls_to_try.append((DEFAULT_CDP_URL, False))
+
+			# 从 DevToolsActivePort 文件读取 WebSocket URL
+			ws_url = self._read_devtools_active_port()
+			if ws_url:
+				urls_to_try.append((ws_url, False))
+
+		for url, explicit in urls_to_try:
+			if self._try_connect(url, explicit=explicit):
+				return True
+			# HTTP URL 连接失败时，尝试从 /json/version 获取 WS URL。
+			# 仅对用户显式提供的 --cdp-url 用较长超时；默认 localhost:9222 自动探测
+			# 用短超时快速失败（无调试端口时避免白等 ~2s）。
+			if url.startswith("http"):
+				probe_timeout = _CDP_PROBE_TIMEOUT if url == self._cdp_url else _CDP_AUTO_PROBE_TIMEOUT
+				ws = self._fetch_ws_url(url, timeout=probe_timeout)
+				if ws and self._try_connect(ws, explicit=explicit):
+					return True
+		return False
+
+	def _reused_context_matches_stored_account(self) -> bool:
+		"""探测到的浏览器是否属于本地保存的那个账号。
+
+		``auto`` 会自动探测 ``localhost:9222``，而 9222 上监听的可能是任何一个
+		Chromium：别的 Electron 应用、用户隔离出来的另一个 profile，甚至**同一个
+		项目的另一个账号**。复用这种 context 意味着拿着招聘者会话去执行候选者的
+		请求，平台侧看到的是账号与调用意图错位（实测会得到 code 37）。
+
+		只在本地确实存有凭据时校验；``existing-browser`` 这类不读本地凭据的来源没有
+		可比对象，保持原样复用。校验失败返回 False，让调用方落到下一个通道（用本地
+		凭据自己起浏览器），而不是把别人的会话据为己有。
+		"""
+		primary = self._cookies.get(_PRIMARY_COOKIE, "")
+		if not primary:
+			return True
+		context_value = self._context_cookie_value(_PRIMARY_COOKIE)
+		if not context_value:
+			# 该 context 未登录：没有可冲突的账号身份，保持既有复用行为。
+			return True
+		if context_value == primary:
+			return True
+		self._log(
+			"[boss] 探测到的浏览器登录的是另一个账号，拒绝复用其会话；"
+			"改用本地凭据自建浏览器"
+		)
+		return False
+
+	def _context_cookie_value(self, name: str) -> str:
+		"""读取当前 context 中某个 cookie 的值；读不到返回空串。"""
+		try:
+			target = _PRIMARY_COOKIE_DOMAIN
+			for cookie in self._context.cookies():
+				if cookie.get("name") != name:
+					continue
+				if _cookie_domain_matches(cookie.get("domain", ""), target):
+					return str(cookie.get("value") or "")
+		except Exception as exc:  # pragma: no cover - 取决于实时 CDP 状态
+			self._log(f"[boss] 读取复用 context 的 cookie 失败：{type(exc).__name__}")
+		return ""
+
+	def _try_connect(self, url: str, *, explicit: bool = True) -> bool:
+		"""Attempt a single CDP connection, reusing user's existing context.
+
+		Reuses the first existing browser context to preserve the user's
+		login state and avoid creating extra browser state. Only creates a
+		new context when none exists.
+		"""
+		# 每次连接尝试都重置就绪标志：复用页签分支不碰 _page_ready，若上一次尝试
+		# 在新建页签 goto 超时留下 False，会污染本次复用的健康页签（review Finding）。
+		self._page_ready = True
+		self._home_nav_error = None
+		try:
+			self._browser = self._pw.chromium.connect_over_cdp(url)
+			contexts = self._browser.contexts
+
+			if contexts:
+				# 复用用户现有 context（保留登录态，避免额外浏览器状态）
+				self._context = contexts[0]
+				self._own_context = False  # 非我们创建，close 时不关闭
+				if not self._reused_context_matches_stored_account():
+					self._close_browser_quietly()
+					return False
+				# 优先复用用户已打开的 zhipin 页签：避免每次高风险 op 都新开空白页 +
+				# 导航到 BOSS 首页（issue #334：用户观感是"反复自动新开/刷新页面"），
+				# 同时降低自动化足迹。请求只需 page 处于 zhipin 同源即可携带 cookie。
+				reused = _find_reusable_zhipin_page(self._context)
+			elif not self._policy.may_create_context or not explicit:
+				# fail-closed：不在用户浏览器里新建 context 注入本地 Cookie。
+				# Issue #387 把「把 Cookie 复制到另一个 Profile」列为反面方案
+				# （凭据暴露 + 会话竞争）。`explicit` 守卫另挡一种情况：自动探测到的
+				# 端点可能是任何在 9222 上监听的 Chromium（其他 Electron 应用、
+				# 用户自己起的隔离 profile），不该被当成用户会话注入 wt2/at。
+				self._log(f"[boss] CDP ({url}) 无可复用 context，按 browser-source={self._policy.name} 拒绝新建")
+				self._close_browser_quietly()
+				return False
+			else:
+				# 没有已存在 context，创建新的并注入 cookies
+				self._context = self._browser.new_context(proxy=resolve_proxy())
+				if self._cookies:
+					self._context.add_cookies(
+						[
+							{"name": name, "value": value, "domain": ".zhipin.com", "path": "/"}
+							for name, value in self._cookies.items()
+						]
+					)
+				self._own_context = True
+				reused = None
+
+			if reused is not None:
+				# 复用已打开的 zhipin 页签：不新建 page、不导航，close 时也不关它
+				self._page = reused
+				self._own_page = False
+				page_label = "复用已打开 zhipin 页签"
+			elif not self._policy.use_stored_credentials:
+				# existing-browser 不读取本地凭据，也不得在用户 context 里新建页面
+				# 再导航到目标站点。没有已打开的 zhipin 页签就视为该候选不可用，
+				# 继续策略表中的下一个通道，最终按 policy fail-closed。
+				self._log(f"[boss] CDP ({url}) 未找到已打开的 zhipin 页签，拒绝导航用户浏览器")
+				self._close_browser_quietly()
+				return False
+			else:
+				self._page = self._context.new_page()
+				self._own_page = True
+				# CDP 模式下用较长超时 + DOM 就绪等待（commit 级返回后立即
+				# evaluate 会撞上 execution context destroyed）
+				try:
+					self._navigate_home(channel="cdp")
+				except BrowserNavigationError as error:
+					# 有界重试后仍未就绪：保留 CDP 会话，request() 再等一次 load，
+					# 仍失败则抛出同一错误，而不是降级到另一个浏览器会话。
+					# 风控异常不在这里捕获，交给外层按 request stop 原样上抛。
+					self._page_ready = False
+					self._home_nav_error = error
+					page_label = "新建 page（首页未就绪）"
+				else:
+					page_label = "新建 page"
+			self._started = True
+			self._is_cdp = True
+			reuse_label = "复用用户 context" if not self._own_context else "新建 context"
+			self._log(f"[boss] CDP 连接成功 ({url})，{reuse_label} + {page_label}")
+			return True
+		except Exception as error:
+			self._close_browser_quietly()
+			if is_request_stop(error):
+				raise
+			return False
+
+	def _close_browser_quietly(self) -> None:
+		"""关掉本次 connect_over_cdp 建立的 browser 句柄，失败静默。
+
+		只断开我们这一侧的连接，不影响用户浏览器本身。
+		"""
+		if self._browser:
+			try:
+				self._browser.close()
+			except Exception:
+				pass
+			self._browser = None
+		self._context = None
+
+	@staticmethod
+	def _fetch_ws_url(http_url: str, timeout: float = _CDP_PROBE_TIMEOUT) -> str | None:
+		"""Fetch WebSocket debugger URL from Chrome's /json/version endpoint."""
+		import httpx
+
+		try:
+			resp = httpx.get(f"{http_url}/json/version", timeout=timeout)
+			payload = resp.json()
+			if not isinstance(payload, dict):
+				return None
+			return cast("str | None", payload.get("webSocketDebuggerUrl"))
+		except (httpx.HTTPError, ValueError, KeyError):
+			return None
+
+	@staticmethod
+	def _read_devtools_active_port() -> str | None:
+		"""Read Chrome's DevToolsActivePort file to get WS endpoint."""
+		for user_data_dir in _CHROME_USER_DATA_CANDIDATES:
+			port_file = user_data_dir / "DevToolsActivePort"
+			if port_file.exists():
+				try:
+					lines = port_file.read_text().strip().splitlines()
+					if len(lines) >= 2:
+						port = lines[0].strip()
+						ws_path = lines[1].strip()
+						return f"ws://127.0.0.1:{port}{ws_path}"
+				except Exception:
+					continue
+		return None
+
+	def _start_headless(self) -> None:
+		"""Fallback: launch headless patchright Chromium."""
+		self._browser = self._pw.chromium.launch(
+			headless=True,
+			proxy=resolve_proxy(),
+			args=list(WEBRTC_LEAK_GUARD_ARGS),
+		)
+		self._context = self._browser.new_context(
+			user_agent=self._user_agent,
+			viewport={"width": 1280, "height": 800},
+			locale="zh-CN",
+			timezone_id="Asia/Shanghai",
+			proxy=resolve_proxy(),
+		)
+		self._own_context = True
+		self._own_page = True
+		self._context.add_cookies(
+			[
+				{"name": name, "value": value, "domain": ".zhipin.com", "path": "/"}
+				for name, value in self._cookies.items()
+			]
+		)
+		self._page = self._context.new_page()
+		self._navigate_home(channel="headless")
+		try:
+			self._page.wait_for_load_state("networkidle", timeout=_HEADLESS_NETWORKIDLE_GRACE_MS)
+		except Exception as e:
+			if is_request_stop(e):
+				raise
+			# zhipin 首页常驻请求较多，headless 模式下不一定能进入 networkidle；
+			# 页面 JS 环境已可用时，继续直接发起 fetch 请求更稳。
+			self._log(f"[boss] headless 首页未进入 networkidle（{e}），继续直接发起请求")
+		self._started = True
+		self._is_cdp = False
+		self._log(
+			"[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright"
+		)
+
+	def ensure_started(self) -> None:
+		"""按来源策略建立浏览器通道（不发平台请求）；供请求前的本地检查使用。"""
+		self._ensure_started()
+		self._raise_if_security_page()
+
+	def current_stoken_hash(self) -> str | None:
+		"""CDP 模式下读取 Chrome 当前 ``__zp_stoken__`` 的 SHA-256 摘要。
+
+		走 ``context.cookies()``，只是本机 CDP 调用，不访问平台；返回值只有摘要，
+		原值不离开本函数。非 CDP 会话或读取失败返回 ``None``（调用方按「无法确认」处理）。
+		"""
+		from boss_agent_cli.api.cdp_risk_lock import stoken_hash_from_cookies
+
+		if not self._is_cdp or self._context is None:
+			return None
+		try:
+			cookies = self._context.cookies(HOME_URL)
+		except Exception:
+			return None
+		return stoken_hash_from_cookies(cookies)
+
+	# ── Core request via browser fetch() ─────────────────────────────
+
+	def request(
+		self, method: str, url: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None
+	) -> dict[str, Any]:
+		self._ensure_started()
+		self._raise_if_security_page()
+		endpoint = endpoint_for_request(method, url)
+		replay_safe = bool(endpoint is not None and endpoint.replay_safe)
+
+		referer = endpoints.REFERER_MAP.get(url, f"{endpoints.BASE_URL}/")
+
+		# Playwright 模式（CDP 或 headless）
+		# 新建 CDP 页签若 goto 超时（_page_ready=False），页面可能仍在导航、执行上下文
+		# 未建立；此时直接 evaluate(fetch) 会永久挂起（同 #390）。先做有界就绪恢复，
+		# 仍不就绪则返回错误信封而非挂起。
+		if not self._page_ready:
+			try:
+				self._page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+			except Exception as error:
+				if is_request_stop(error):
+					raise
+				self._raise_if_security_page()
+				pending = self._home_nav_error
+				if pending is not None:
+					raise pending
+				raise BrowserNavigationError(
+					HOME_URL,
+					attempts=1,
+					timeout_ms=_NAV_TIMEOUT_MS,
+					channel="cdp" if self._is_cdp else "headless",
+					cause=error,
+				) from error
+			else:
+				self._page_ready = True
+				self._home_nav_error = None
+				self._raise_if_security_page()
+		payload = {
+			"method": method.upper(),
+			"url": url,
+			"params": params or {},
+			"data": data,
+			"referer": referer,
+			"timeoutMs": _REQUEST_TIMEOUT_MS,
+			# 页面自己给业务 XHR 加的 token/zp_token；缺了它浏览器通道就和 httpx 通道
+			# 不是同一个客户端（见 docs/research/zhipin-request-identity-2026-10-29.md）。
+			"identity": dict(self._identity),
+			# 页面每个请求换一个 traceid；浏览器通道同样按请求生成。
+			"traceId": new_trace_id(),
+		}
+		try:
+			result = self._send_fetch(payload, endpoint)
+		except Exception as exc:
+			# 复用用户页签时，用户恰好在请求那一瞬间手动导航会让执行上下文被销毁
+			# （Chromium 返回 "Execution context was destroyed"）。仅明确可重放的读取
+			# 可做一次有界就绪恢复；写操作/未知操作的副作用不能确定，必须先核对结果。
+			if not _is_context_destroyed_error(exc):
+				from boss_agent_cli.api.client import PlatformRiskError
+
+				if is_request_stop(exc):
+					raise
+				if not replay_safe and not isinstance(exc, PlatformRiskError):
+					return self._interrupted_request_response(endpoint)
+				raise
+			self._page_ready = False
+			if not replay_safe:
+				return self._interrupted_request_response(endpoint)
+			try:
+				self._page.wait_for_load_state("domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+			except Exception:
+				return {
+					"code": -1,
+					"message": "页面在请求期间发生导航且未在超时内就绪，无法发起请求；请稍后重试",
+					"zpData": {},
+				}
+			self._page_ready = True
+			self._raise_if_security_page()
+			result = self._send_fetch(payload, endpoint)
+		return result
+
+	def _raise_if_security_page(self) -> None:
+		url = getattr(self._page, "url", "")
+		if isinstance(url, str):
+			page_risk = platform_risk_page_response(url=url)
+			if page_risk is not None:
+				raise_platform_risk_response(page_risk, is_cdp=self._is_cdp)
+
+	def _evaluate_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
+		"""Bound Chromium evaluation as well as the fetch/body promise.
+
+		CDP's renderer timeout complements the abortable network deadline. A broken
+		Playwright driver transport still requires its normal disconnect handling;
+		this does not cancel a write which the platform may already have accepted.
+		"""
+		cdp = self._context.new_cdp_session(self._page)
+		try:
+			response = cdp.send(
+				"Runtime.evaluate",
+				{
+					"expression": _build_eval_expression(_FETCH_SCRIPT, payload),
+					"returnByValue": True,
+					"awaitPromise": True,
+					"timeout": _EVALUATE_TIMEOUT_MS,
+				},
+			)
+			if response.get("exceptionDetails"):
+				return {"__cli_request_interrupted__": True}
+			value = (response.get("result") or {}).get("value")
+			if not isinstance(value, dict):
+				return {"__cli_request_interrupted__": True}
+			return value
+		except Exception as exc:
+			if (
+				isinstance(exc, TimeoutError)
+				or "timed out" in str(exc).lower()
+				or "execution was terminated" in str(exc).lower()
+			):
+				return {"__cli_request_interrupted__": True}
+			raise
+		finally:
+			try:
+				cdp.detach()
+			except Exception:
+				pass
+
+	@staticmethod
+	def _interrupted_request_response(endpoint: EndpointSpec | None) -> dict[str, Any]:
+		write_possible = endpoint is None or endpoint.effect != "read"
+		code = "ACTION_UNCONFIRMED" if write_possible else "NETWORK_ERROR"
+		return {
+			"code": -1,
+			"message": "请求期间页面或响应中断；操作可能已生效，请先核对结果，勿直接重试"
+			if write_possible
+			else "浏览器读取请求中断或超时，请检查页面后恢复",
+			"zpData": {},
+			"__cli_error_code__": code,
+			"__cli_error_details__": {"outcome": "unknown", "replay_safe": False},
+		}
+
+	# ── Arbitrary JS evaluation (CDP-only, raw websocket) ────────────
+
+	def evaluate_js(self, script: str, arg: Any = None) -> Any:
+		"""Run JS in the user's recruiter chat tab via raw CDP websocket.
+
+		Required for recruiter send_message (issue #217): we reach into the
+		招聘者 chat page's Vue 2 instance to call geek-list.geekClick() +
+		editor.sendText(). The normal BrowserSession.request fetch path can't
+		do that — it runs JS in a blank tab BrowserSession owns, not in the
+		user's recruiter tab.
+
+		Why raw CDP instead of patchright: attaching patchright to another
+		tab we didn't create via new_page() triggers 'Frame was detached'
+		errors when that page navigates or re-renders (Vue SFC rebuilds
+		frame tree). Raw CDP is a stateless RPC — we just send
+		Runtime.evaluate and read the result, no session book-keeping.
+
+		Intentionally does NOT call _ensure_started(): patchright's
+		connect_over_cdp enumerates every tab's frame tree on attach, which
+		can race with Vue re-renders on the recruiter page and crash the
+		Node driver before we even get to our evaluate call. evaluate_js
+		only needs the CDP HTTP endpoint reachable — not patchright.
+
+		仅通过已有 CDP 浏览器及其招聘者聊天页执行；headless 实例无法访问用户的 Vue 运行时。
+		"""
+		self._require_cdp_source("evaluate_js")
+		cdp_url = self._cdp_url or DEFAULT_CDP_URL
+		return _cdp_evaluate_in_chat_tab(cdp_url, script, arg)
+
+	def evaluate_js_with_chat_events(self, script: str, arg: Any = None, *, listen_ms: int = 3000) -> dict[str, Any]:
+		"""Run JS in the recruiter chat tab and collect short-lived chat WS events.
+
+		Used by recruiter send_message verification to distinguish a real chat send
+		from UI-only draft mutation or suggestion traffic.
+		"""
+		self._require_cdp_source("evaluate_js_with_chat_events")
+		cdp_url = self._cdp_url or DEFAULT_CDP_URL
+		return _cdp_evaluate_with_chat_events_in_chat_tab(cdp_url, script, arg, listen_ms=listen_ms)
+
+	def _require_cdp_source(self, api: str) -> None:
+		"""裸 CDP 路径的来源守卫。
+
+		``evaluate_js`` 系列刻意绕过 ``_ensure_started``（见上方 docstring：
+		patchright 附着别人的 tab 会撞 'Frame was detached'），所以它不受
+		分发器约束——这是本类最大的 fail-open 面：一个禁用了 CDP 的来源，
+		在这条路上照样会直连 ``DEFAULT_CDP_URL``。此处补上等价守卫。
+		"""
+		if not self._policy.allows(CHANNEL_CDP):
+			raise BrowserSourceUnavailable(
+				self._policy,
+				(CHANNEL_CDP,),
+				detail=f"{api} 需要 CDP 通道，而 browser-source={self._policy.name} 不允许",
+			)
+		if not self._policy.auto_probe_cdp and not self._cdp_url:
+			raise BrowserSourceUnavailable(
+				self._policy,
+				(CHANNEL_CDP,),
+				detail=f"{api} 需要显式 --cdp-url（browser-source={self._policy.name} 不自动探测端点）",
+			)
+
+	# ── Lifecycle ────────────────────────────────────────────────────
+
+	@property
+	def is_cdp(self) -> bool:
+		"""Whether this session is using CDP connection to user's Chrome."""
+		return self._is_cdp
+
+	def close(self) -> None:
+		if not self._started:
+			# 已关闭 / 从未成功启动：只确保 driver 不泄漏，不重复拆卸。
+			# 真正的幂等守卫——否则第二次 close 会因为 _reset_channel_state 已把
+			# _is_cdp 置 False 而走进 headless 分支，对一个 CDP 会话执行错误的拆卸。
+			self._release_playwright()
+			return
+
+		if self._is_cdp:
+			# CDP 模式：只关闭我们新建的 page 和 context，不动用户浏览器或已复用的页签
+			if self._page and self._own_page:
+				try:
+					self._page.close()
+				except Exception:
+					pass
+			if self._own_context and self._context:
+				try:
+					self._context.close()
+				except Exception:
+					pass
+		else:
+			# Headless 模式：关闭整个浏览器实例
+			if self._browser:
+				try:
+					self._browser.close()
+				except Exception:
+					pass
+		self._release_playwright()
+		self._reset_channel_state()
+
+	def _reset_channel_state(self) -> None:
+		"""close 后把**通道标志**复位到「从未启动」。
+
+		同时复位 ``_started`` 和 ``_is_cdp``，避免重新启动或重复 close 时
+		带着上一轮通道标志走错资源清理分支。
+
+		刻意**不**清 ``_page`` / ``_context`` / ``_browser``：它们在重启时由
+		``_try_connect`` / ``_start_headless`` 的每个分支无条件覆盖，而清空会让
+		「close 之后仍可检视上一轮句柄」这个既有性质消失（多条既有测试依赖它）。
+		``_policy`` 同样不复位：它是构造期决定的来源意图，不属于通道状态。
+		"""
+		self._started = False
+		self._is_cdp = False
+
+	def __enter__(self) -> "BrowserSession":
+		return self
+
+	def __exit__(
+		self,
+		exc_type: type[BaseException] | None,
+		exc_val: BaseException | None,
+		exc_tb: TracebackType | None,
+	) -> None:
+		self.close()
+
+
+# ─── Raw CDP helper for evaluate_js ──────────────────────────────────────
+
+
+def _pick_chat_target_ws(cdp_http_url: str) -> str:
+	import json as _json
+	import urllib.request
+
+	list_url = cdp_http_url.rstrip("/") + "/json"
+	try:
+		with urllib.request.urlopen(list_url, timeout=3) as resp:
+			tabs = _json.load(resp)
+	except Exception as exc:
+		raise RuntimeError(f"cannot reach CDP at {list_url}: {exc}") from exc
+
+	for t in tabs:
+		if t.get("type") == "page" and is_zhipin_url(t.get("url", "")) and "/web/chat/index" in t.get("url", ""):
+			target_ws = t.get("webSocketDebuggerUrl")
+			if target_ws:
+				return cast("str", target_ws)
+	raise RecruiterChatTabRequired()
+
+
+def _build_eval_expression(script: str, arg: Any) -> str:
+	import json as _json
+
+	if arg is not None:
+		return f"({script})({_json.dumps(arg, ensure_ascii=False)})"
+	return script
+
+
+def _carve_utf8_bits(bs: bytes) -> list[str]:
+	out: list[str] = []
+	i = 0
+	while i < len(bs):
+		for length in range(min(len(bs) - i, 240), 4, -1):
+			try:
+				text = bs[i : i + length].decode("utf-8")
+			except UnicodeDecodeError:
+				continue
+			if len(text) >= 5 and all(ch.isprintable() or ch in "\n\r\t" for ch in text):
+				out.append(text)
+				i += length
+				break
+		else:
+			i += 1
+	return out
+
+
+def _cdp_evaluate_in_chat_tab(cdp_http_url: str, script: str, arg: Any) -> Any:
+	"""Send Runtime.evaluate to the BOSS recruiter chat tab via raw CDP.
+
+	Bypasses patchright entirely — avoids 'Frame was detached' errors when
+	the Vue page re-renders during our call. Wraps the caller's script as
+	`(fnSrc)(arg)` when arg is provided, so the script can be a JS expression
+	that evaluates to a function of one argument (mirrors patchright's
+	`page.evaluate(script, arg)` contract used by the PoC).
+	"""
+	import json as _json
+
+	import websockets.sync.client as _ws_client
+
+	target_ws = _pick_chat_target_ws(cdp_http_url)
+	expression = _build_eval_expression(script, arg)
+
+	with _ws_client.connect(target_ws, max_size=8 * 1024 * 1024, open_timeout=5, close_timeout=1) as ws:
+		ws.send(
+			_json.dumps(
+				{
+					"id": 1,
+					"method": "Runtime.evaluate",
+					"params": {
+						"expression": expression,
+						"returnByValue": True,
+						"awaitPromise": True,
+						"timeout": _EVALUATE_TIMEOUT_MS,
+					},
+				}
+			)
+		)
+		deadline = time.monotonic() + (_EVALUATE_TIMEOUT_MS / 1000.0)
+		while time.monotonic() < deadline:
+			raw = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+			msg = _json.loads(raw)
+			if msg.get("id") != 1:
+				continue
+			err = msg.get("error")
+			if err:
+				raise RuntimeError(f"CDP Runtime.evaluate error: {err}")
+			result = msg.get("result", {}).get("result", {})
+			if "value" in result:
+				return result["value"]
+			# Exception in JS side
+			exc_details = msg.get("result", {}).get("exceptionDetails")
+			if exc_details:
+				raise RuntimeError(
+					f"JS exception: {exc_details.get('text')} — {exc_details.get('exception', {}).get('description', '')[:300]}"
+				)
+			return result
+		raise RuntimeError("CDP Runtime.evaluate timed out after 30s")
+
+
+def _ws_frame_payload_bytes(frame: dict[str, Any]) -> bytes:
+	"""CDP 对文本帧（opcode 1）给原文、二进制帧（opcode 2）给 base64，分别还原。"""
+	payload_data = frame.get("payloadData", "")
+	if not isinstance(payload_data, str):
+		return b""
+	if frame.get("opcode") == 1:
+		return payload_data.encode("utf-8", errors="ignore")
+	try:
+		return base64.b64decode(payload_data, validate=False)
+	except Exception:
+		return payload_data.encode("utf-8", errors="ignore")
+
+
+#: 31 = IP/访问环境限制，32 = 账号访问限制；37 另保留明确过期的上下文分类。
+_PAGE_RISK_CODES = (31, "31", 32, "32", 35, "35", 36, "36", 37, "37")
+_MAX_TRACKED_RESPONSES = 64
+
+
+class _PageRiskResponseTracker:
+	"""跟踪聊天页在页面动作期间自己发出的 ``/wapi/`` JSON 响应。
+
+	页面动作（换微信、求简历、发消息）由 BOSS 前端代发请求，CLI 看不到这些响应；
+	这里借同一条 CDP 连接的 Network 事件读回响应体，只保留命中风控/访问限制的
+	极简记录（路径、码、截断后的文案），其余响应不留任何内容。
+	"""
+
+	def __init__(self) -> None:
+		self._pending: dict[str, str] = {}
+		self._body_requests: dict[int, str] = {}
+		self._next_id = 1000
+		self.events: list[dict[str, Any]] = []
+
+	def handles(self, msg: dict[str, Any]) -> bool:
+		return msg.get("method") in ("Network.responseReceived", "Network.loadingFinished") or (
+			isinstance(msg.get("id"), int) and msg["id"] in self._body_requests
+		)
+
+	def on_message(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+		"""处理一条 CDP 消息；需要读响应体时返回要发出的 CDP 命令。"""
+		from urllib.parse import urlsplit
+
+		method = msg.get("method")
+		params = msg.get("params") or {}
+		if method == "Network.responseReceived":
+			response = params.get("response") or {}
+			url = str(response.get("url") or "")
+			mime = str(response.get("mimeType") or "").lower()
+			request_id = params.get("requestId")
+			if is_zhipin_url(url):
+				page_risk = platform_risk_page_response(url=url)
+				if page_risk is not None:
+					self._record_page_risk(urlsplit(url).path, page_risk)
+					return None
+			is_business_api = is_zhipin_url(url) and urlsplit(url).path.startswith("/wapi/")
+			if is_business_api and response.get("status") == 403:
+				# 不等 loadingFinished 或正文：403 可能没有可读取的响应体。
+				self.events.append(
+					{
+						"kind": "http_risk",
+						"path": urlsplit(url).path,
+						"code": 36,
+						"__cli_platform_code__": None,
+						"message": "页面接口返回 HTTP 403，当前动作已停止",
+					}
+				)
+				return None
+			if (
+				is_business_api
+				and ("json" in mime or "html" in mime or mime in ("", "text/plain"))
+				and isinstance(request_id, str)
+			):
+				if len(self._pending) < _MAX_TRACKED_RESPONSES:
+					self._pending[request_id] = urlsplit(url).path
+			return None
+		if method == "Network.loadingFinished":
+			request_id = params.get("requestId")
+			path = self._pending.pop(request_id, None) if isinstance(request_id, str) else None
+			if path is None:
+				return None
+			command_id = self._next_id
+			self._next_id += 1
+			self._body_requests[command_id] = path
+			return {"id": command_id, "method": "Network.getResponseBody", "params": {"requestId": request_id}}
+		msg_id = msg.get("id")
+		if isinstance(msg_id, int) and msg_id in self._body_requests:
+			path = self._body_requests.pop(msg_id)
+			result = msg.get("result") or {}
+			body = result.get("body")
+			if not isinstance(body, str):
+				return None
+			if result.get("base64Encoded"):
+				try:
+					body = base64.b64decode(body).decode("utf-8", errors="ignore")
+				except Exception:
+					return None
+			try:
+				data = json.loads(body)
+			except ValueError:
+				# JSON 内的普通说明即使包含 HTML 验证标题，也不是安全页。
+				page_risk = platform_risk_page_response(content_type="text/html", body=body)
+				if page_risk is not None:
+					self._record_page_risk(path, page_risk)
+				return None
+			if isinstance(data, dict) and data.get("code") in _PAGE_RISK_CODES:
+				from boss_agent_cli.api.zhipin_errors import response_message
+
+				self.events.append(
+					{
+						"kind": "http_risk",
+						"path": path,
+						"code": int(data["code"]),
+						"message": response_message(data)[:120],
+					}
+				)
+		return None
+
+	def _record_page_risk(self, path: str, response: dict[str, Any]) -> None:
+		if response["__cli_risk_source__"] == "security_page":
+			self.events.append({"kind": "http_risk", "path": path, "code": 36, "message": "官方安全验证页"})
+		else:
+			self.events.append({"kind": "http_risk", "path": path, **response})
+
+
+def read_cdp_stoken_hash(cdp_http_url: str) -> str | None:
+	"""经裸 CDP（``Storage.getCookies``）读取 Chrome 当前 ``__zp_stoken__`` 的摘要。
+
+	只连本机 CDP 端点、不访问平台、不附着 patchright（聊天页动作刻意不走 patchright）；
+	读不到时返回 ``None``，调用方按「无法确认」处理（风控锁 fail-closed）。
+	"""
+	import urllib.request
+
+	import websockets.sync.client as _ws_client
+
+	from boss_agent_cli.api.cdp_risk_lock import stoken_hash_from_cookies
+
+	try:
+		with urllib.request.urlopen(cdp_http_url.rstrip("/") + "/json/version", timeout=3) as resp:
+			ws_url = json.load(resp).get("webSocketDebuggerUrl")
+		if not ws_url:
+			return None
+		with _ws_client.connect(ws_url, max_size=16 * 1024 * 1024) as ws:
+			ws.send(json.dumps({"id": 1, "method": "Storage.getCookies"}))
+			deadline = time.time() + 5.0
+			while time.time() < deadline:
+				msg = json.loads(ws.recv(timeout=max(0.1, deadline - time.time())))
+				if msg.get("id") != 1:
+					continue
+				if msg.get("error"):
+					return None
+				return stoken_hash_from_cookies((msg.get("result") or {}).get("cookies"))
+	except Exception:
+		return None
+	return None
+
+
+def _cdp_evaluate_with_chat_events_in_chat_tab(
+	cdp_http_url: str, script: str, arg: Any, *, listen_ms: int
+) -> dict[str, Any]:
+	import json as _json
+
+	import websockets.sync.client as _ws_client
+
+	target_ws = _pick_chat_target_ws(cdp_http_url)
+	expression = _build_eval_expression(script, arg)
+
+	with _ws_client.connect(target_ws, max_size=8 * 1024 * 1024, open_timeout=5, close_timeout=1) as ws:
+		ws.send(_json.dumps({"id": 1, "method": "Network.enable"}))
+		ws.send(
+			_json.dumps(
+				{
+					"id": 2,
+					"method": "Runtime.evaluate",
+					"params": {
+						"expression": expression,
+						"returnByValue": True,
+						"awaitPromise": True,
+						"timeout": _EVALUATE_TIMEOUT_MS,
+					},
+				}
+			)
+		)
+
+		events: list[dict[str, Any]] = []
+		risk_tracker = _PageRiskResponseTracker()
+		eval_value: Any = None
+		eval_done = False
+		deadline = time.monotonic() + (_EVALUATE_TIMEOUT_MS / 1000.0)
+		listen_deadline: float | None = None
+
+		while True:
+			now = time.monotonic()
+			if eval_done and listen_deadline is not None and now >= listen_deadline:
+				return {"value": eval_value, "events": events + risk_tracker.events}
+			if now >= deadline:
+				raise RuntimeError("CDP Runtime.evaluate timed out after 30s")
+
+			timeout = 0.1 if eval_done and listen_deadline is not None else max(0.1, deadline - now)
+			try:
+				raw = ws.recv(timeout=timeout)
+			except TimeoutError:
+				continue
+
+			msg = _json.loads(raw)
+			msg_id = msg.get("id")
+			if msg_id == 2:
+				err = msg.get("error")
+				if err:
+					raise RuntimeError(f"CDP Runtime.evaluate error: {err}")
+				result = msg.get("result", {}).get("result", {})
+				exc_details = msg.get("result", {}).get("exceptionDetails")
+				if exc_details:
+					raise RuntimeError(
+						f"JS exception: {exc_details.get('text')} — "
+						f"{exc_details.get('exception', {}).get('description', '')[:300]}"
+					)
+				eval_value = result.get("value", result)
+				eval_done = True
+				listen_deadline = time.monotonic() + min(max(listen_ms, 0), _EVALUATE_TIMEOUT_MS) / 1000.0
+				continue
+
+			if risk_tracker.handles(msg):
+				command = risk_tracker.on_message(msg)
+				if risk_tracker.events:
+					return {"value": eval_value, "events": events + risk_tracker.events}
+				if command is not None:
+					ws.send(_json.dumps(command))
+				continue
+
+			method = msg.get("method")
+			if method not in ("Network.webSocketFrameSent", "Network.webSocketFrameReceived"):
+				continue
+			frame = msg.get("params", {}).get("response", {})
+			if frame.get("opcode") not in (1, 2):
+				continue
+
+			bs = _ws_frame_payload_bytes(frame)
+			if len(bs) < 30:
+				continue
+
+			events.append(
+				{
+					"ts": time.time(),
+					"kind": "ws_send" if method.endswith("Sent") else "ws_recv",
+					"bytes": len(bs),
+					"utf8_bits": _carve_utf8_bits(bs)[:10],
+				}
+			)

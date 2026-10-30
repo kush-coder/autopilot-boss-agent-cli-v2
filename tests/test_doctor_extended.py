@@ -1,0 +1,845 @@
+"""doctor.py 扩展测试 — 覆盖各检查项的正常/异常路径。"""
+
+import io
+import json
+import shlex
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch, MagicMock
+
+import pytest
+from click.testing import CliRunner
+from rich.console import Console
+from boss_agent_cli.main import cli
+
+
+# ── 辅助 ─────────────────────────────────────────────────────────────
+
+
+def _base_patches():
+	"""返回 doctor 命令核心 mock 的 patch 路径字典。"""
+	return {
+		"auth": "boss_agent_cli.commands.doctor.AuthManager",
+		"cdp": "boss_agent_cli.commands.doctor.probe_cdp",
+		"httpx": "boss_agent_cli.commands.doctor.httpx.get",
+		"cookie": "boss_agent_cli.commands.doctor.extract_cookies",
+	}
+
+
+def _invoke_doctor(tmp_path=None, platform="zhipin", **overrides):
+	"""执行 doctor 命令并返回 (exit_code, parsed_json)。
+
+	overrides 可以覆盖 token / cdp_ws / cookie / http_status / http_exc。
+	传入 tmp_path 以使用隔离的 data-dir，避免读取本机真实文件。
+	"""
+	runner = CliRunner()
+	paths = _base_patches()
+	with (
+		patch(paths["auth"]) as mock_auth,
+		patch(paths["cdp"]) as mock_cdp,
+		patch(paths["httpx"]) as mock_httpx,
+		patch(paths["cookie"]) as mock_cookie,
+	):
+		# 默认值
+		mock_auth.return_value.check_status.return_value = overrides.get("token", None)
+		mock_cdp.return_value = overrides.get("cdp_ws", None)
+		mock_cookie.return_value = overrides.get("cookie", None)
+
+		if "http_exc" in overrides:
+			mock_httpx.side_effect = overrides["http_exc"]
+		else:
+			mock_httpx.return_value = MagicMock(status_code=overrides.get("http_status", 200))
+
+		cli_args = []
+		if tmp_path is not None:
+			cli_args.extend(["--data-dir", str(tmp_path)])
+		if platform != "zhipin":
+			cli_args.extend(["--platform", platform])
+		for key in ("cdp_url", "browser_source"):
+			if key in overrides:
+				cli_args.extend(["--" + key.replace("_", "-"), overrides[key]])
+		# 默认给一个高于实测可持续节奏的间隔：request_delay 检查只在配置确实
+		# 偏低时才 warn（见 docs/research/zhipin-cdp-free-read-path-2026-10-29.md）。
+		cli_args.extend(["--delay", overrides.get("delay", "45-90")])
+		cli_args.append("doctor")
+		if overrides.get("probe_cookies"):
+			cli_args.append("--probe-cookies")
+		result = runner.invoke(cli, cli_args)
+	parsed = json.loads(result.output)
+	return result.exit_code, parsed
+
+
+def _find_check(checks, name):
+	return next((c for c in checks if c["name"] == name), None)
+
+
+# ── 1. 所有检查项正常通过 ────────────────────────────────────────────
+
+
+def test_all_checks_pass(tmp_path):
+	"""所有检查项均为 ok 时 summary 应为 healthy（环境依赖项除外）。"""
+	token = {"cookies": {"wt2": "tok", "wbg": "1", "zp_at": "a"}, "stoken": "st_ok", "user_agent": "ua"}
+	code, parsed = _invoke_doctor(
+		tmp_path,
+		token=token,
+		cdp_ws="ws://127.0.0.1:9222/devtools/browser/abc",
+		cookie={"cookies": {"wt2": "tok"}},
+		http_status=200,
+		probe_cookies=True,
+	)
+	assert code == 0
+	assert parsed["ok"] is True
+	# 核心逻辑检查项（不依赖本机工具链）应全部为 ok
+	env_dependent = {"patchright", "patchright_chromium", "browser", "auth_salt", "windows_uv_tool_path"}
+	for check in parsed["data"]["checks"]:
+		if check["name"] in env_dependent:
+			continue
+		assert check["status"] == "ok", f"{check['name']} 状态应为 ok，实际为 {check['status']}"
+
+
+# ── 2. Python 版本不满足 ─────────────────────────────────────────────
+
+
+def test_python_version_below_311(tmp_path):
+	"""Python 版本低于 3.11 时 python 检查应为 error。"""
+
+	class FakeVersionInfo(tuple):
+		"""模拟 sys.version_info：同时支持元组比较和属性访问。"""
+
+		major = 3
+		minor = 10
+		micro = 1
+
+		def __new__(cls):
+			return tuple.__new__(cls, (3, 10, 1))
+
+	original = sys.version_info
+	sys.version_info = FakeVersionInfo()
+	try:
+		code, parsed = _invoke_doctor(tmp_path)
+	finally:
+		sys.version_info = original
+	python_check = _find_check(parsed["data"]["checks"], "python")
+	assert python_check is not None
+	assert python_check["status"] == "error"
+	assert "3.11" in python_check["detail"]
+
+
+def test_python_version_satisfies(tmp_path):
+	"""当前测试运行的 Python 应满足 >=3.11。"""
+	code, parsed = _invoke_doctor(tmp_path)
+	python_check = _find_check(parsed["data"]["checks"], "python")
+	assert python_check["status"] == "ok"
+
+
+# ── 3. 依赖缺失 ─────────────────────────────────────────────────────
+
+
+@patch("boss_agent_cli.commands.doctor.shutil.which", return_value=None)
+def test_patchright_missing(mock_which, tmp_path):
+	"""patchright 可执行文件不在 PATH 中时应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path)
+	pr_check = _find_check(parsed["data"]["checks"], "patchright")
+	assert pr_check["status"] == "warn"
+	assert "未找到" in pr_check["detail"]
+
+
+# ── 4. 网络不通 ──────────────────────────────────────────────────────
+
+
+def test_network_failure(tmp_path):
+	"""访问 zhipin.com 抛异常时 network 应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, http_exc=ConnectionError("network down"))
+	network_check = _find_check(parsed["data"]["checks"], "network")
+	assert network_check is not None
+	assert network_check["status"] == "warn"
+	assert "失败" in network_check["detail"]
+
+
+def test_network_http_error_status(tmp_path):
+	"""zhipin.com 返回 HTTP 5xx 时 network 应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, http_status=503)
+	network_check = _find_check(parsed["data"]["checks"], "network")
+	assert network_check["status"] == "warn"
+
+
+def test_network_ok(tmp_path):
+	"""zhipin.com 返回 200 时 network 应为 ok。"""
+	code, parsed = _invoke_doctor(tmp_path, http_status=200)
+	network_check = _find_check(parsed["data"]["checks"], "network")
+	assert network_check["status"] == "ok"
+
+
+# ── 5. 登录态检查 ────────────────────────────────────────────────────
+
+
+def test_auth_logged_in_full(tmp_path):
+	"""wt2 + stoken 均在时 auth_token_quality 应为 ok。"""
+	token = {"cookies": {"wt2": "tok"}, "stoken": "stoken_val"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "ok"
+	assert "完整" in quality["detail"]
+	stoken_presence = _find_check(parsed["data"]["checks"], "stoken_presence")
+	assert stoken_presence["status"] == "ok"
+
+
+def test_auth_logged_in_no_stoken(tmp_path):
+	"""wt2 存在但 stoken 缺失时 quality 应为 warn。"""
+	token = {"cookies": {"wt2": "tok"}, "stoken": ""}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "warn"
+	assert "stoken 缺失" in quality["detail"]
+	stoken_presence = _find_check(parsed["data"]["checks"], "stoken_presence")
+	assert stoken_presence["status"] == "warn"
+	assert "CDP" in stoken_presence["recovery_action"]
+	assert parsed["data"]["auth_state"] == "partial"
+
+
+def test_auth_logged_in_no_wt2(tmp_path):
+	"""stoken 存在但 wt2 缺失时 quality 应为 error。"""
+	token = {"cookies": {}, "stoken": "stoken_val"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "error"
+	assert "wt2 缺失" in quality["detail"]
+
+
+def test_auth_logged_in_both_missing(tmp_path):
+	"""wt2 和 stoken 均缺失时 quality 应为 error。"""
+	token = {"cookies": {}, "stoken": ""}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "error"
+	assert "均缺失" in quality["detail"]
+
+
+def test_auth_not_logged_in(tmp_path):
+	"""未登录时（无 session 文件）auth_session 应为 warn，quality 也应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, token=None)
+	session = _find_check(parsed["data"]["checks"], "auth_session")
+	assert session["status"] == "warn"
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "warn"
+	# next_actions 应包含 login 提示
+	assert any(a.endswith(" login") for a in parsed["hints"]["next_actions"])
+
+
+def test_auth_session_file_exists_but_undecryptable(tmp_path):
+	"""session.enc 存在但无法解密时 auth_session 应为 error。"""
+	auth_dir = tmp_path / "auth"
+	auth_dir.mkdir(parents=True)
+	(auth_dir / "session.enc").write_text("corrupted")
+	code, parsed = _invoke_doctor(tmp_path, token=None)
+	session = _find_check(parsed["data"]["checks"], "auth_session")
+	assert session["status"] == "error"
+	assert "损坏" in session["detail"]
+
+
+# ── 6. CDP 可用/不可用 ───────────────────────────────────────────────
+
+
+def test_cdp_available(tmp_path):
+	"""CDP 探测返回 ws url 时 cdp 检查应为 ok。"""
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws="ws://127.0.0.1:9222/devtools/browser/abc")
+	cdp_check = _find_check(parsed["data"]["checks"], "cdp")
+	assert cdp_check["status"] == "ok"
+
+
+def test_cdp_unavailable(tmp_path):
+	"""CDP 探测返回 None 时 cdp 检查应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws=None)
+	cdp_check = _find_check(parsed["data"]["checks"], "cdp")
+	assert cdp_check["status"] == "warn"
+
+
+def test_cdp_probe_exception(tmp_path):
+	"""CDP 探测抛异常时 cdp 检查应为 error。"""
+	paths = _base_patches()
+	runner = CliRunner()
+	with (
+		patch(paths["auth"]) as mock_auth,
+		patch(paths["cdp"]) as mock_cdp,
+		patch(paths["httpx"]) as mock_httpx,
+		patch(paths["cookie"]) as mock_cookie,
+	):
+		mock_auth.return_value.check_status.return_value = None
+		mock_cdp.side_effect = RuntimeError("probe boom")
+		mock_cookie.return_value = None
+		mock_httpx.return_value = MagicMock(status_code=200)
+
+		result = runner.invoke(cli, ["--data-dir", str(tmp_path), "doctor"])
+	parsed = json.loads(result.output)
+	cdp_check = _find_check(parsed["data"]["checks"], "cdp")
+	assert cdp_check["status"] == "error"
+	assert "probe boom" in cdp_check["detail"]
+
+
+def test_doctor_reports_only_supported_browser_diagnostics(tmp_path):
+	"""CDP 可用即可通过浏览器通道检查，不再生成已移除组件的诊断项。"""
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws="ws://127.0.0.1:9222/devtools/browser/abc")
+
+	assert code == 0
+	checks = parsed["data"]["checks"]
+	assert not any(check["name"].startswith("bridge_") for check in checks)
+	browser_channel = _find_check(checks, "browser_channel")
+	assert browser_channel["status"] == "ok"
+	assert "CDP" in browser_channel["detail"]
+	assert "Bridge" not in json.dumps(parsed, ensure_ascii=False)
+
+
+def test_doctor_does_not_contact_removed_bridge(tmp_path):
+	"""诊断不向旧 daemon 发起状态探测或执行请求，所有 HTTP 均由替身接收。"""
+	paths = _base_patches()
+	with (
+		patch(paths["auth"]) as mock_auth,
+		patch(paths["cdp"], return_value=None),
+		patch(paths["httpx"]) as mock_httpx,
+		patch(paths["cookie"], return_value=None),
+		patch("httpx.post") as mock_post,
+	):
+		mock_auth.return_value.check_status.return_value = None
+		mock_httpx.return_value = MagicMock(status_code=200)
+
+		result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "doctor"])
+
+	assert result.exit_code == 0
+	assert mock_httpx.call_count > 0
+	assert all("19826" not in str(call.args[0]) for call in mock_httpx.call_args_list)
+	mock_post.assert_not_called()
+
+
+# ── 7. 输出 JSON 格式正确性 ─────────────────────────────────────────
+
+
+def test_json_envelope_structure(tmp_path):
+	"""验证 doctor 输出的 JSON 信封结构完整。"""
+	code, parsed = _invoke_doctor(tmp_path)
+	assert code == 0
+	# 顶层字段
+	assert "ok" in parsed
+	assert "command" in parsed
+	assert "data" in parsed
+	assert "hints" in parsed
+	# data 子字段
+	data = parsed["data"]
+	assert "summary" in data
+	assert "auth_state" in data
+	assert "data_dir" in data
+	assert "live_probe" in data
+	assert "check_count" in data
+	assert "checks" in data
+	assert isinstance(data["checks"], list)
+	assert data["check_count"] == len(data["checks"])
+	# 每条 check 的字段
+	for check in data["checks"]:
+		assert "name" in check
+		assert "status" in check
+		assert "detail" in check
+		assert check["status"] in ("ok", "warn", "error")
+
+
+def test_summary_degraded_when_warn_only(tmp_path):
+	"""只有 warn（无 error）时 summary 应为 degraded。"""
+	code, parsed = _invoke_doctor(tmp_path, token=None, cdp_ws=None, cookie=None)
+	summary = parsed["data"]["summary"]
+	has_error = any(c["status"] == "error" for c in parsed["data"]["checks"])
+	has_warn = any(c["status"] == "warn" for c in parsed["data"]["checks"])
+	if has_error:
+		assert summary == "broken"
+	elif has_warn:
+		assert summary == "degraded"
+
+
+def test_summary_broken_when_error_exists(tmp_path):
+	"""存在 error 检查项时 summary 应为 broken。"""
+	token = {"cookies": {}, "stoken": "stoken_val"}  # no wt2 => error
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	quality = _find_check(parsed["data"]["checks"], "auth_token_quality")
+	assert quality["status"] == "error"
+	assert parsed["data"]["summary"] == "broken"
+
+
+# ── 8. browser_channel 检查 ──────────────────────────────────────────
+
+
+def test_browser_channel_ok_with_cdp(tmp_path):
+	"""CDP 可用时 browser_channel 应为 ok 且提示 CDP 模式。"""
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws="ws://127.0.0.1:9222/devtools/browser/abc")
+	ch = _find_check(parsed["data"]["checks"], "browser_channel")
+	assert ch is not None
+	assert ch["status"] == "ok"
+	assert "CDP" in ch["detail"]
+
+
+def test_browser_channel_warn_without_cdp(tmp_path):
+	"""CDP 不可用时 browser_channel 应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws=None)
+	ch = _find_check(parsed["data"]["checks"], "browser_channel")
+	assert ch is not None
+	assert ch["status"] == "warn"
+	assert "httpx" in ch["detail"]
+	assert "Bridge" not in ch["detail"]
+
+
+# ── 9. cookie 提取检查 ───────────────────────────────────────────────
+
+
+def test_cookie_extract_ok(tmp_path):
+	"""显式探测时，本地浏览器可提取 Cookie 应为 ok。"""
+	code, parsed = _invoke_doctor(tmp_path, cookie={"cookies": {"wt2": "v", "token": "t"}}, probe_cookies=True)
+	ce = _find_check(parsed["data"]["checks"], "cookie_extract")
+	assert ce["status"] == "ok"
+	assert "提取" in ce["detail"]
+
+
+def test_cookie_extract_not_available(tmp_path):
+	"""显式探测但仍提取不到 Cookie 时应为 warn。"""
+	code, parsed = _invoke_doctor(tmp_path, cookie=None, probe_cookies=True)
+	ce = _find_check(parsed["data"]["checks"], "cookie_extract")
+	assert code == 0
+	assert ce["status"] == "warn"
+
+
+def test_doctor_does_not_read_browser_cookies_by_default(tmp_path):
+	"""默认诊断不碰浏览器 Cookie，避免 macOS 钥匙串弹窗。"""
+	code, parsed = _invoke_doctor(tmp_path, cookie={"cookies": {"wt2": "v"}})
+	ce = _find_check(parsed["data"]["checks"], "cookie_extract")
+	assert code == 0
+	assert ce["status"] == "ok"
+	assert ce["detail"] == "未读取浏览器 Cookie"
+	assert "--probe-cookies" in ce["hint"]
+
+
+# ── 10. next_actions 提示逻辑 ────────────────────────────────────────
+
+
+def test_next_actions_suggests_login_when_not_logged_in(tmp_path):
+	code, parsed = _invoke_doctor(tmp_path, token=None)
+	actions = parsed["hints"]["next_actions"]
+	assert any(a.endswith(" login") for a in actions)
+
+
+def test_next_actions_suggests_cdp_when_cdp_unavailable(tmp_path):
+	code, parsed = _invoke_doctor(tmp_path, cdp_ws=None)
+	actions = parsed["hints"]["next_actions"]
+	assert any("cdp" in a.lower() for a in actions)
+
+
+def test_next_actions_suggests_status_when_logged_in(tmp_path):
+	token = {"cookies": {"wt2": "tok"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token, cdp_ws="ws://x")
+	actions = parsed["hints"]["next_actions"]
+	assert any(a.endswith(" status --live") for a in actions)
+
+
+@pytest.mark.parametrize("token", [None, {"cookies": {"wt2": "fixture"}}, {"cookies": {"wt2": "fixture"}, "stoken": "fixture"}])
+def test_doctor_hints_separate_executable_commands_and_human_steps(tmp_path, token):
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	assert code == 0
+	hints = parsed["hints"]
+	assert hints["operator_actions"]
+	for action in hints["next_actions"]:
+		assert action.startswith("boss ")
+		assert " — " not in action
+		assert "&&" not in action
+		assert action.endswith((" login", " status --live", " doctor"))
+	assert any("平台风控" in action for action in hints["operator_actions"])
+
+
+def test_doctor_damaged_auth_requires_human_confirmation(tmp_path):
+	with patch("boss_agent_cli.commands.doctor.assess_auth_health") as assess:
+		health = assess.return_value
+		health.token_present = True
+		health.auth_state = "invalid"
+		health.salt_path = tmp_path / "salt"
+		health.checks_as_dicts.return_value = [{"name": "auth_token_quality", "status": "error", "detail": "损坏"}]
+		code, parsed = _invoke_doctor(tmp_path, cdp_ws="ws://fixture")
+	assert code == 0
+	assert not any(action.endswith((" login", " logout")) for action in parsed["hints"]["next_actions"])
+	assert any("确认需要重建" in action for action in parsed["hints"]["operator_actions"])
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_doctor_command_preserves_context_and_quotes_paths(tmp_path, monkeypatch, windows):
+	from boss_agent_cli.commands import _doctor_checks
+
+	monkeypatch.setattr(_doctor_checks, "os", SimpleNamespace(name="nt" if windows else "posix"))
+	data_dir = tmp_path / "owner's & data"
+	ctx = SimpleNamespace(obj={
+		"data_dir": data_dir, "platform": "candidate-only", "role": "recruiter",
+		"browser_source": "existing-browser", "cdp_url": "http://localhost:9444",
+	})
+	command = _doctor_checks._doctor_command(ctx, "doctor")
+	argv = [
+		"boss", "--data-dir", str(data_dir.resolve()), "--platform", "candidate-only",
+		"--role", "recruiter", "--browser-source", "existing-browser",
+		"--cdp-url", "http://localhost:9444", "doctor",
+	]
+	if windows:
+		quoted_path = "'" + str(data_dir.resolve()).replace("'", "''") + "'"
+		assert command == "boss --data-dir " + quoted_path + " " + " ".join(argv[3:])
+	else:
+		assert shlex.split(command) == argv
+
+
+def test_doctor_recovery_keeps_explicit_cdp_address(tmp_path):
+	code, parsed = _invoke_doctor(tmp_path, cdp_url="http://localhost:9444", browser_source="existing-browser")
+	assert code == 0
+	actions = parsed["hints"]["next_actions"]
+	diagnostic = next(action for action in actions if action.endswith(" doctor"))
+	assert "--cdp-url http://localhost:9444" in diagnostic
+	assert "--browser-source existing-browser" in diagnostic
+	assert "localhost:9222" not in diagnostic
+
+
+def test_installed_doctor_omits_developer_checks_and_hints(tmp_path):
+	with (
+		patch("boss_agent_cli.commands._doctor_checks._find_project_root", return_value=None),
+		patch("boss_agent_cli.commands._doctor_checks._resolve_quality_tool") as resolve,
+	):
+		code, parsed = _invoke_doctor(tmp_path)
+	assert code == 0
+	resolve.assert_not_called()
+	assert not any(item["name"].startswith("quality_") for item in parsed["data"]["checks"])
+	assert "quality_baseline.py" not in json.dumps(parsed["hints"])
+
+
+def test_source_detection_does_not_use_installed_users_current_project(tmp_path, monkeypatch):
+	from boss_agent_cli.commands import _doctor_checks
+
+	project = tmp_path / "unrelated"
+	(project / "scripts").mkdir(parents=True)
+	(project / "pyproject.toml").write_text('[project]\nname="unrelated"\n', encoding="utf-8")
+	(project / "scripts" / "quality_baseline.py").touch()
+	monkeypatch.chdir(project)
+	monkeypatch.setattr(_doctor_checks, "__file__", str(tmp_path / "site-packages" / "boss_agent_cli" / "commands" / "_doctor_checks.py"))
+	assert _doctor_checks._find_project_root() is None
+
+
+def test_source_detection_and_missing_baseline_are_explicit(tmp_path, monkeypatch):
+	from boss_agent_cli.commands import _doctor_checks
+
+	source = tmp_path / "src" / "boss_agent_cli" / "commands" / "_doctor_checks.py"
+	source.parent.mkdir(parents=True)
+	source.touch()
+	(tmp_path / "pyproject.toml").write_text('[project]\nname="boss-agent-cli"\n', encoding="utf-8")
+	monkeypatch.setattr(_doctor_checks, "__file__", str(source))
+	assert _doctor_checks._find_project_root() == tmp_path
+	checks = []
+	assert _doctor_checks._add_quality_baseline_checks(checks) is None
+	assert _find_check(checks, "quality_baseline")["status"] == "warn"
+
+
+def test_doctor_tty_renders_human_steps_without_agent_command_list(tmp_path, monkeypatch):
+	from boss_agent_cli import display
+
+	stream = io.StringIO()
+	monkeypatch.setattr(display, "console", Console(file=stream, width=200, force_terminal=False))
+	monkeypatch.setattr(display, "is_json_mode", lambda ctx: False)
+	paths = _base_patches()
+	with (
+		patch(paths["auth"]) as auth,
+		patch(paths["cdp"], return_value="ws://fixture"),
+		patch(paths["httpx"], return_value=MagicMock(status_code=200)),
+		patch(paths["cookie"], return_value=None),
+	):
+		auth.return_value.check_status.return_value = {"cookies": {"wt2": "fixture"}, "stoken": "fixture"}
+		result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "doctor"])
+	assert result.exit_code == 0, result.output
+	assert result.stdout == ""
+	assert "你需要" in stream.getvalue()
+	assert "平台风控" in stream.getvalue()
+	assert "boss --data-dir" not in stream.getvalue()
+
+
+# ── Cookie 完整性检查（wbg/zp_at） ─────────────────────────────────
+
+
+def test_cookie_completeness_all_present(tmp_path):
+	"""四个关键 Cookie 全部存在时应报 ok。"""
+	token = {"cookies": {"wt2": "t", "wbg": "1", "zp_at": "a"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	completeness = _find_check(parsed["data"]["checks"], "cookie_completeness")
+	assert completeness is not None
+	assert completeness["status"] == "ok"
+
+
+def test_cookie_completeness_missing_wbg(tmp_path):
+	"""wbg 缺失时应报 warn。"""
+	token = {"cookies": {"wt2": "t", "zp_at": "a"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	completeness = _find_check(parsed["data"]["checks"], "cookie_completeness")
+	assert completeness is not None
+	assert completeness["status"] == "warn"
+	assert "wbg" in completeness["detail"]
+
+
+def test_doctor_includes_layered_auth_health_checks(tmp_path):
+	token = {"cookies": {"wt2": "tok"}, "stoken": "stoken_val"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	names = {item["name"] for item in parsed["data"]["checks"]}
+	assert {
+		"credential_file",
+		"cookie_presence",
+		"wt2_presence",
+		"stoken_presence",
+		"stoken_freshness",
+		"candidate_search_health",
+		"candidate_detail_health",
+		"recruiter_read_health",
+	}.issubset(names)
+
+
+def test_doctor_redacts_sensitive_token_values(tmp_path):
+	token = {
+		"cookies": {"wt2": "secret-wt2", "wbg": "secret-wbg", "zp_at": "secret-zp"},
+		"stoken": "secret-stoken",
+		"user_agent": "ua",
+	}
+	code, parsed = _invoke_doctor(tmp_path, token=token, cookie={"cookies": {"wt2": "secret-wt2"}})
+	output = json.dumps(parsed, ensure_ascii=False)
+	assert "secret-wt2" not in output
+	assert "secret-stoken" not in output
+	assert "secret-zp" not in output
+
+
+@patch("boss_agent_cli.commands._doctor_checks.get_recruiter_platform_instance")
+@patch("boss_agent_cli.commands._doctor_checks.get_platform_instance")
+def test_doctor_live_probe_adds_readonly_probe_checks(mock_platform_cls, mock_recruiter_cls, tmp_path):
+	paths = _base_patches()
+	runner = CliRunner()
+	with (
+		patch(paths["auth"]) as mock_auth,
+		patch(paths["cdp"]) as mock_cdp,
+		patch(paths["httpx"]) as mock_httpx,
+		patch(paths["cookie"]) as mock_cookie,
+	):
+		mock_auth.return_value.check_status.return_value = {"cookies": {"wt2": "tok"}, "stoken": "st"}
+		mock_cdp.return_value = None
+		mock_cookie.return_value = None
+		mock_httpx.return_value = MagicMock(status_code=200)
+
+		platform = mock_platform_cls.return_value
+		platform.__enter__ = lambda self: self
+		platform.__exit__ = lambda self, *a: None
+		platform.user_info.return_value = {"zpData": {"name": "tester"}}
+		platform.is_success.return_value = True
+
+		recruiter = mock_recruiter_cls.return_value
+		recruiter.__enter__ = lambda self: self
+		recruiter.__exit__ = lambda self, *a: None
+		recruiter.list_jobs.return_value = {"zpData": {"list": []}}
+		recruiter.is_success.return_value = True
+
+		result = runner.invoke(cli, ["--data-dir", str(tmp_path), "doctor", "--live-probe"])
+
+	parsed = json.loads(result.output)
+	assert _find_check(parsed["data"]["checks"], "candidate_live_user_info")["status"] == "ok"
+	assert _find_check(parsed["data"]["checks"], "recruiter_live_read")["status"] == "ok"
+	assert _find_check(parsed["data"]["checks"], "recruiter_identity")["status"] == "warn"
+	recruiter.list_jobs.assert_called_once()
+
+
+def _live_probe(tmp_path, payload):
+	paths = _base_patches()
+	runner = CliRunner()
+	with (
+		patch(paths["auth"]) as mock_auth,
+		patch(paths["cdp"]) as mock_cdp,
+		patch(paths["httpx"]) as mock_httpx,
+		patch(paths["cookie"]) as mock_cookie,
+		patch("boss_agent_cli.commands._doctor_checks.get_platform_instance") as mock_platform_cls,
+		patch("boss_agent_cli.commands._doctor_checks.get_recruiter_platform_instance") as mock_recruiter_cls,
+	):
+		mock_auth.return_value.check_status.return_value = {"cookies": {"wt2": "tok"}, "stoken": "st"}
+		mock_cdp.return_value = None
+		mock_cookie.return_value = None
+		mock_httpx.return_value = MagicMock(status_code=200)
+		platform = mock_platform_cls.return_value
+		platform.__enter__ = lambda self: self
+		platform.__exit__ = lambda self, *a: None
+		platform.user_info.return_value = {"zpData": payload}
+		platform.is_success.return_value = True
+		recruiter = mock_recruiter_cls.return_value
+		recruiter.__enter__ = lambda self: self
+		recruiter.__exit__ = lambda self, *a: None
+		recruiter.list_jobs.return_value = {"zpData": {"list": []}}
+		recruiter.is_success.return_value = True
+		result = runner.invoke(cli, ["--data-dir", str(tmp_path), "doctor", "--live-probe"])
+	return json.loads(result.output), recruiter
+
+
+def test_doctor_live_probe_skips_recruiter_api_on_candidate_side(tmp_path):
+	parsed, recruiter = _live_probe(tmp_path, {
+		"identity": 0,
+		"doubleIdentity": True,
+		"recruit": False,
+		"name": "hidden",
+	})
+	identity = _find_check(parsed["data"]["checks"], "recruiter_identity")
+	read = _find_check(parsed["data"]["checks"], "recruiter_live_read")
+	assert identity["status"] == "warn"
+	assert "求职者侧" in identity["detail"]
+	assert "双身份" in identity["detail"]
+	assert read["detail"] == "当前登录态在求职者侧，未请求招聘者接口"
+	assert "hidden" not in json.dumps(parsed, ensure_ascii=False)
+	recruiter.list_jobs.assert_not_called()
+
+
+def test_doctor_live_probe_reads_recruiter_api_when_identity_is_recruiter(tmp_path):
+	parsed, recruiter = _live_probe(tmp_path, {"identity": 1, "recruit": False, "phone": "hidden"})
+	assert _find_check(parsed["data"]["checks"], "recruiter_identity")["status"] == "ok"
+	assert _find_check(parsed["data"]["checks"], "recruiter_live_read")["status"] == "ok"
+	assert "hidden" not in json.dumps(parsed, ensure_ascii=False)
+	recruiter.list_jobs.assert_called_once()
+
+
+def test_cookie_completeness_missing_zp_at(tmp_path):
+	"""zp_at 缺失时应报 warn。"""
+	token = {"cookies": {"wt2": "t", "wbg": "1"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	completeness = _find_check(parsed["data"]["checks"], "cookie_completeness")
+	assert completeness is not None
+	assert completeness["status"] == "warn"
+	assert "zp_at" in completeness["detail"]
+
+
+def test_cookie_completeness_both_missing(tmp_path):
+	"""wbg 和 zp_at 均缺失时应报 warn 并列出所有缺失项。"""
+	token = {"cookies": {"wt2": "t"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	completeness = _find_check(parsed["data"]["checks"], "cookie_completeness")
+	assert completeness is not None
+	assert completeness["status"] == "warn"
+	assert "wbg" in completeness["detail"]
+	assert "zp_at" in completeness["detail"]
+
+
+def test_doctor_login_preflight_blocks_missing_auth_before_platform_requests(tmp_path):
+	code, parsed = _invoke_doctor(tmp_path, token=None)
+	preflight = _find_check(parsed["data"]["checks"], "login_preflight")
+	assert preflight is not None
+	assert preflight["status"] == "error"
+	assert "禁止发起需要认证的平台请求" in preflight["detail"]
+	assert "boss login" in preflight["recovery_action"]
+
+
+def test_doctor_login_preflight_warns_on_partial_auth(tmp_path):
+	token = {"cookies": {"wt2": "tok"}}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	preflight = _find_check(parsed["data"]["checks"], "login_preflight")
+	assert preflight is not None
+	assert preflight["status"] == "warn"
+	assert "只读请求可能失败" in preflight["detail"]
+	assert "刷新登录态" in preflight["recovery_action"]
+
+
+def test_doctor_login_preflight_passes_complete_auth(tmp_path):
+	token = {"cookies": {"wt2": "tok"}, "stoken": "st"}
+	code, parsed = _invoke_doctor(tmp_path, token=token)
+	preflight = _find_check(parsed["data"]["checks"], "login_preflight")
+	assert preflight is not None
+	assert preflight["status"] == "ok"
+	assert "登录前置通过" in preflight["detail"]
+
+
+def test_doctor_reports_quality_baseline(tmp_path):
+	code, parsed = _invoke_doctor(tmp_path)
+	assert code == 0
+	checks = parsed["data"]["checks"]
+	baseline = _find_check(checks, "quality_baseline")
+	assert baseline["status"] == "ok"
+	assert "scripts/quality_baseline.py" in baseline["detail"]
+	for tool in ("ruff", "pytest", "mypy"):
+		assert _find_check(checks, f"quality_tool_{tool}")["status"] in {"ok", "warn"}
+	assert not any("quality_baseline.py" in action for action in parsed["hints"]["next_actions"])
+	assert any("quality_baseline.py" in action for action in parsed["hints"]["operator_actions"])
+
+
+def test_windows_playwright_cache_dir_uses_localappdata(tmp_path, monkeypatch):
+	"""Windows 默认 ms-playwright 缓存应纳入 doctor 检测。"""
+	from boss_agent_cli.services.browser_runtime import patchright_browser_cache_dirs
+
+	local_app_data = tmp_path / "AppData" / "Local"
+	monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+
+	dirs = patchright_browser_cache_dirs()
+
+	assert local_app_data / "ms-playwright" in dirs
+
+
+def test_resolve_quality_tool_uses_uv_run_when_tool_missing(monkeypatch):
+	"""全局 tool 环境 PATH 缺质量工具时，uv run 可用不应误报缺失。"""
+	from boss_agent_cli.commands._doctor_checks import _resolve_quality_tool
+
+	def fake_which(name):
+		return "/usr/bin/uv" if name == "uv" else None
+
+	monkeypatch.setattr("boss_agent_cli.commands._doctor_checks.shutil.which", fake_which)
+
+	status, detail, hint = _resolve_quality_tool("pytest")
+
+	assert status == "ok"
+	assert "uv run pytest" in detail
+	assert "uv run pytest" in hint
+
+
+def test_evaluate_patchright_chromium_requires_exact_revision(tmp_path):
+	"""回归：缓存里有其他修订版不代表 patchright 可用，必须精确匹配所需修订版。"""
+	from boss_agent_cli.services.browser_runtime import evaluate_patchright_chromium
+
+	installed = [
+		tmp_path / "chromium-1217",
+		tmp_path / "chromium-1223",
+		tmp_path / "chromium_headless_shell-1217",
+	]
+	status, detail = evaluate_patchright_chromium("1208", installed)
+	assert status == "warn"
+	assert "chromium-1208" in detail
+	assert "boss login" in detail
+
+	status_ok, detail_ok = evaluate_patchright_chromium("1217", installed)
+	assert status_ok == "ok"
+	assert "chromium-1217" in detail_ok
+
+
+def test_evaluate_patchright_chromium_reports_missing_headless_shell(tmp_path):
+	"""Windows/global tool 环境缺 headless shell 时应给出精确恢复命令。"""
+	from boss_agent_cli.services.browser_runtime import evaluate_patchright_chromium
+
+	status, detail = evaluate_patchright_chromium("1223", [tmp_path / "chromium-1223"])
+
+	assert status == "warn"
+	assert "chromium_headless_shell-1223" in detail
+	assert "patchright install chromium-headless-shell" in detail
+
+
+def test_evaluate_patchright_chromium_falls_back_without_manifest(tmp_path):
+	"""browsers.json 不可读时退回旧的目录计数口径，不阻断 doctor。"""
+	from boss_agent_cli.services.browser_runtime import evaluate_patchright_chromium
+
+	status, detail = evaluate_patchright_chromium(None, [tmp_path / "chromium-1217"])
+	assert status == "ok"
+	assert "无法确认" in detail
+
+	status_empty, _ = evaluate_patchright_chromium(None, [])
+	assert status_empty == "warn"
+
+
+def test_patchright_chromium_revision_reads_packaged_manifest():
+	"""patchright 是项目硬依赖，应能从其 browsers.json 读出数字修订版。"""
+	from boss_agent_cli.services.browser_runtime import patchright_chromium_revision
+
+	revision = patchright_chromium_revision()
+	assert revision is not None
+	assert revision.isdigit()
+
+
+def test_doctor_no_longer_probes_zhaopin(tmp_path):
+	"""智联平台已移除：doctor 不再额外访问 zhaopin.com，也不输出 network_zhilian 检查项。"""
+	_code, parsed = _invoke_doctor(tmp_path)
+	checks = parsed["data"]["checks"]
+	assert _find_check(checks, "network_zhilian") is None
+	assert not any("zhaopin" in json.dumps(check, ensure_ascii=False) for check in checks)

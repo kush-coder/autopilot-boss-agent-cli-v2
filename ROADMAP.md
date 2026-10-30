@@ -1,0 +1,88 @@
+# Roadmap
+
+本文档记录 boss-agent-cli 的中长期规划。欢迎对任何方向提 Issue 或 PR。
+
+## 已发布
+
+- ✅ v2.0.0（2026-09-15）：公开可严格限界的 `--browser-source` 并贯通 CLI / config / schema / MCP / wizard；新增 `login --force`、CDP 登录态只读有效性探测与 cURL 凭据导入；补齐招聘者推荐建联及附件简历接收下载；统一账号/环境风控的立即终止语义；移除未完成的前程无忧 / 51job 占位平台与 Atlas 展示位/provider 接入（Breaking Change）
+- ✅ v1.20.0（2026-09-03）：适配 mcp 2.x Server API（依赖 `mcp>=2.1.0,<3.0.0`，MCP 线格式未变）+ 修复设了 SOCKS 系统代理时每一条 httpx 命令都失败 + 浏览器通道选择收敛为策略表驱动的单一分发点（#387 seam 前置）+ `boss ai config` 回显解析后的实际端点 + AI provider 准入与移除规则成文
+- ✅ v1.19.1（2026-08-27）：修复全新安装解析到 mcp 2.x 导致 `boss-mcp` 直接崩溃（依赖收紧为 `<2.0.0`），并新增不走 `uv.lock` 的 `fresh_install` CI 门禁
+- ✅ v1.19.0（2026-08-27）：修复 MCP `tools/list` 从未注册（v1.18.0 起 MCP 入口对所有 host 不可用）并补齐协议层与 CI 门禁 + 开放 assisted / research 下全部已实现能力 + 纯终端 `boss wizard` 统一为单交互窗口 + 信封 `hints` 拆分 Agent / 真人双受众通道
+- ✅ v1.18.0（2026-07-29）：可用 Docker / Compose 镜像与 CI 构建门禁 + MCP schema 契约修复与 `mcp_server` 拆分 + 离线 evals 进 P0 + ruff 规则钉死与依赖刷新（rich 15）
+- ✅ v1.17.0（2026-07-27）：`boss favorites list/sync` 职位收藏同步 + 受限 Research Mode 的可恢复 crawl 工作流 + 实习岗位类型字段与筛选映射修复
+- ✅ v1.16.0（2026-07-17）：显式 `operating_mode` 双模式契约（`assisted` / `research`）+ 合规护栏升级为不可变能力策略注册表，CLI / schema / MCP 过滤从同一真源派生
+- ✅ v1.15.0（2026-07-14）：`boss ai cover-letter` 求职信草稿 + 死配置键与死码清理 + 智联页面域名校验加固（精确 hostname 匹配）
+- ✅ v1.14.0（2026-06-25）：shortlist 本地标签 / 备注 / 离线对比 + `ai fit` / `ai suggest-keywords` / `ai resume-optimize` + 转向 MCP-first + 搜索 `match_score`
+- ✅ v1.13.x（2026-06-11 ~ 06-16）：platforms 能力状态语义 + login 链路错误码补齐 + welfare 详情本地缓存 + 双语 README 重构为导航型；Agent Skill 迁出至独立仓库 [boss-skill](https://github.com/can4hou6joeng4/boss-skill)（Breaking Change）
+- ✅ v1.12.0（2026-06-09）：MCP 三种传输（stdio / SSE / HTTP streaming）+ `boss_export` + 51job / `qiancheng` 占位适配器
+- ✅ v1.11.0（2026-04-23）：招聘者模式（`--role recruiter`）全套 CLI 命令组 + `BossRecruiterClient` 双通道客户端 + `RecruiterPlatform` 抽象
+- ✅ v1.10.x（2026-04-21）：Platform 抽象落地 —— ABC + 注册表 + `--platform` 全局选项 + 20 个命令全量迁移，`commands/` 下不再直接引用 `BossClient`
+- ✅ v1.9.x（2026-04-20）：mypy 严格模式全量接入（66/66 业务模块）+ Python 嵌入 API + `py.typed` 类型导出
+- ✅ v1.8.x（2026-04-19 ~ 04-20）：AI 沟通与面试扩展（`ai interview-prep` / `ai chat-coach`）+ Cursor / Windsurf 接入 + 英文贡献指南
+- ✅ v1.7.0（2026-04-17）：聊天回复草稿 + 投递漏斗
+
+完整历史见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 🎯 近期（当前主线）
+
+### 数据可视化
+- [x] `boss stats --format html` 输出交互式漏斗报表（v1.7.1）
+- [x] `boss digest --format md` 每日摘要邮件/飞书可直接发送（v1.8.1）
+- [x] codecov badge 集成到 README（v1.7.1）
+
+### Agent 集成
+- [x] MCP 服务支持 HTTP streaming / SSE / stdio 三种传输（2026-04-27，PR #160）
+- [x] Codex / Cursor / Windsurf 专用接入示例（v1.8.1，docs/integrations/ 全覆盖）
+- [x] OpenAI Functions 格式导出 `boss schema --format openai-tools`（v1.7.1）
+
+### 智能能力
+- [x] `boss ai chat-coach` — 基于聊天记录给出沟通技巧建议（v1.8.0）
+- [x] `boss ai interview-prep` — 基于 JD 生成模拟面试题（v1.8.0）
+- [x] 支持 Claude 4.7 / GPT-5 最新模型（v1.8.2，provider 扩至 openrouter/qwen/zhipu/siliconflow）
+
+## 🔮 中期（v2.0）
+
+### 治理与合规
+- [x] 默认低风险辅助模式：敏感命令默认阻断并交接回平台官网（ADR 0001）
+- [x] 显式 `operating_mode` 双模式契约：`assisted` / `research` 单一真源驱动 CLI、schema 与 MCP 过滤（v1.16.0，ADR 0002）
+- [x] 受限 Research Mode 采集：固定请求 / 详情 / 墙钟 / 重试预算 + SQLite checkpoint + 停止开关（v1.17.0）
+
+### 架构演进
+- [x] mypy 严格模式全量接入 — **100% 完成**（66/66 业务模块全部 `disallow_untyped_defs + disallow_any_generics + warn_return_any` 严格化，v1.9.1）
+- [x] 类型签名导出到 `stubs/`，供下游 IDE 使用（v1.8.6，py.typed + canonical `__all__` + 16 条契约测试）
+- [x] 适配 mcp 2.x Server API（Issue #398）：mcp 2.0 移除了 `@server.list_tools()` / `@server.call_tool()` 装饰器，改为 `add_request_handler(method, params_type, handler)`，且 handler 签名与返回类型一并改变（`(ctx, params)` → `ListToolsResult` / `CallToolResult`）。已切到 2.x 并把依赖改为 `mcp>=2.1.0,<3.0.0`；SSE 与 streamable HTTP 两条传输实现原样保留（换实现是独立决策）。handler 注册守卫随之重写：1.x 靠反推 SDK 的装饰器工厂，2.x 改为从 `mcp_server` 源码 AST 扫出 `add_request_handler` 的 method 字面量再问运行时注册表。**上界保留**——上一次无上界导致所有全新安装解析到新大版本并崩溃，而 CI 锁着旧版本永远看不到。
+- [x] 移除 Browser Bridge daemon、Chrome 扩展及可选依赖（v3.0.0）；保留 CDP / headless 浏览器通道，不再推进 Bridge 协议升级
+
+### 生态扩展
+- [ ] Web UI（React + Tailwind），适合非 Agent 用户
+- [ ] 多平台支持：Platform 抽象已落地（Week 1a–1c）；拉勾 / 猎聘 API 调研已完成（Issue #90 已闭环 · [docs/research/platforms/](docs/research/platforms/)），经评估不建议接入；智联适配器曾接入（候选者侧 + 招聘者 agent 自动化），已在 v3.0.0 移除，BOSS 直聘为当前唯一注册平台。
+  - [x] Week 1a：Platform ABC 骨架 + BossPlatform adapter（#129，零行为变化）
+  - [x] Week 1b：`--platform` 全局 CLI 选项 + `get_platform_instance` helper + schema 暴露 current_platform
+  - [x] Week 1c：命令层全量迁移到 Platform 接口（**20 个命令**：greet / apply / batch-greet / interviews / detail / show / me / recommend / chat / chatmsg / mark / exchange / pipeline / digest / search / export / chat_summary / history / status / watch）
+
+### 社区建设
+- [ ] 更完整的中文 + 英文视频 demo / 发布素材（当前已有 `demo/demo-zh.gif` / `demo/demo-en.gif` + 对应 `demo/demo-zh.tape` / `demo/demo-en.tape` 终端演示）
+- [x] [awesome-mcp-servers](https://github.com/punkpeye/awesome-mcp-servers) 收录（PR #4992，2026-04-26 合并）
+- [x] [awesome-agents](https://github.com/kyrolabs/awesome-agents) PR #423 已闭环——由 bot 无 review 直接关闭，同分区存在批量静默关单现象，结论为暂不重投（详见 `docs/marketing/awesome-submissions.md`）
+- [ ] 视时机决定是否进入 [awesome-claude-code](https://github.com/hesreallyhim/awesome-claude-code)（该仓库只接受 Web UI issue 表单，禁止 gh CLI）
+- [x] 贡献者指南英文版（`CONTRIBUTING.en.md`，v1.8.3）
+
+## 💡 长期愿景
+
+**让 AI Agent 真正成为求职助理**，而不是工具调用生成器：
+- Agent 自主完成"搜索 → 筛选 → 打招呼 → 跟进 → 面试准备"全链路
+- 用户只需描述期望（"我想找 30K 以上的远程 Python 岗位"），Agent 自动执行
+- 数据完全本地化，隐私和合规第一
+
+## 🤝 如何参与
+
+1. 在 Issue 标 `good first issue` / `help wanted` 的任务里认领
+2. 对某个方向有兴趣 → 发 Issue 讨论设计
+3. 发现 bug / 文档错误 → 直接发 PR
+4. 不写代码也能贡献：测试报告、使用场景、翻译
+
+参见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+---
+
+> Roadmap 本身是活文档，每次 minor 版本发布时更新。

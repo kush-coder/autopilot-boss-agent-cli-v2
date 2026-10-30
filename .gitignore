@@ -1,0 +1,51 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv*/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.playwright-mcp/
+.codex/
+.worktrees/
+.claude/
+.pi/
+docs/superpowers/
+my-boss-profile.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.ace-tool/
+.agents/skills/
+.agents/skills.disabled-*/
+.trellis/
+skills/*.disabled-*/
+*.html
+!src/**/*.html
+!demo/**/*.html
+*.pdf
+crawl-data/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+
+# recruiter local test files
+/tests/test_recruiter_client.py
+/tests/test_recruiter_commands.py
+/tests/test_recruiter_endpoints.py
+/tests/test_recruiter_platform.py
+/tests/test_resume_parser.py
+
+# 本地专属的社区发帖草稿（未公开前保留在本地）
+docs/blog/linuxdo-promo.md
+
+# baoyu-design working dir (canonical promo source lives in demo/promo-showcase/)
+designs/
+
+# 真实平台抓包的原始产物（含 Cookie 头与响应体，永不入库）
+.capture/

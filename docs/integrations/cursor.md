@@ -1,0 +1,120 @@
+# Cursor Integration Example
+
+Applies to the current `boss-agent-cli` open-capability CLI contract as of August 10, 2026.
+
+Cursor is a VS Code-based AI-first IDE. Its Composer agent can run terminal commands directly, and Cursor 0.42+ can also attach MCP servers. This guide covers two options: native MCP integration (recommended) and shell-command integration (fallback).
+
+## Good fit when
+
+- you want Composer to drive candidate or recruiter workflows inside Cursor
+- you want `boss` exposed as MCP tools instead of pasted shell snippets
+- you already maintain `.cursor/rules/` and want to add BOSS Zhipin capability
+
+## Minimal integration
+
+Cursor supports two approaches. Use whichever fits your setup.
+
+### Option 1: MCP server integration (recommended)
+
+In Cursor Settings → MCP, add a stdio server that points to this repo's `mcp-server/server.py`:
+
+```json
+{
+  "mcpServers": {
+    "boss-agent-cli": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/absolute/path/to/boss-agent-cli",
+        "run",
+        "python",
+        "mcp-server/server.py"
+      ]
+    }
+  }
+}
+```
+
+Once enabled, Composer will discover all 78 implemented MCP tools, including `boss_wizard`, candidate search/apply/chat workflows, recruiter candidate workflows, local resume tools, and AI helpers.
+
+For Windows / VS Code-style `mcp.json`, use escaped backslashes in the project path:
+
+```json
+{
+  "servers": {
+    "boss-agent-cli": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "E:\\tools\\boss-agent-cli",
+        "run",
+        "python",
+        "mcp-server/server.py"
+      ]
+    }
+  }
+}
+```
+
+### Option 2: shell-command integration
+
+Add a rule like this to `.cursor/rules/boss-agent-cli.mdc`:
+
+```markdown
+---
+description: BOSS Zhipin job-hunt capability
+globs:
+alwaysApply: false
+---
+
+When the user asks to search jobs, inspect job details, or organize candidate jobs locally:
+1. Run `boss schema` first to learn the capability surface
+2. Then run `boss status` to check authentication
+3. If not logged in, run `boss login` and ask the user to scan if needed
+4. Use `boss search <query> --city <city> --welfare <keywords>` for discovery
+5. Use `boss detail <security_id>` to inspect a matching job
+6. Use `boss shortlist add`, `boss apply`, or `boss greet` according to the user's goal
+7. Read stdout JSON only; when `ok=false`, inspect `error.recovery_action`
+```
+
+Minimal command chain:
+
+```bash
+boss schema
+boss status
+boss search "Golang" --city 广州 --welfare "双休,五险一金"
+boss detail <security_id>
+boss shortlist add <security_id> <job_id>
+```
+
+## Fields to parse
+
+- `ok`: whether the command succeeded
+- `data`: jobs, details, or action results
+- `hints.next_actions`: suggested next command
+- `error.code`: recovery routing
+- `error.recovery_action`: how the agent should recover
+
+## Recovery flow
+
+Recommended order:
+
+```bash
+boss doctor
+boss status
+boss login
+```
+
+Common branches:
+
+- `AUTH_REQUIRED` / `AUTH_EXPIRED`: run `boss login` again
+- `INVALID_PARAM`: return to `boss schema` and validate parameter names
+- `RATE_LIMITED`: wait before retrying; do not continue sensitive automation
+- `ACCOUNT_RISK`: stop the workflow, preserve its checkpoint, and resume only after the account-risk condition is resolved
+- `ENVIRONMENT_RISK`: stop the workflow the same way; do not refresh tokens, re-login, or retry, and resume only after the user has confirmed the page state in the same dedicated browser profile
+
+## Advanced ideas
+
+- Wire `boss ai interview-prep <jd>` and `boss ai chat-coach <chat>` into Composer for resume matching and communication coaching
+- Use `boss stats` and `boss_shortlist_list` for local-state summaries; use `boss_digest` or `boss_wizard` for platform conversation workflows

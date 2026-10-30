@@ -1,0 +1,250 @@
+"""BOSS 直聘招聘者平台 adapter。
+
+把 ``BossRecruiterClient`` 包装为 ``RecruiterPlatform`` 实现，统一包络与业务拒绝语义。
+后续新平台实现同一 RecruiterPlatform 接口，
+命令层可以通过 ``get_recruiter_platform(name)`` 无差别调用。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from boss_agent_cli.api.recruiter_endpoints import BASE_URL, BOSS_CHAT_START_URL, CODE_ACCOUNT_RESTRICTED, CODE_IP_RESTRICTED, CODE_STOKEN_EXPIRED
+from boss_agent_cli.api.zhipin_errors import classify_code_37, response_message
+from boss_agent_cli.platforms.recruiter_base import RecruiterPlatform
+
+if TYPE_CHECKING:
+	from boss_agent_cli.api.recruiter_client import BossRecruiterClient
+
+
+# BOSS 直聘错误码 → 统一错误码映射
+_ERROR_CODE_MAP: dict[int, str] = {
+	7: "AUTH_REQUIRED",
+	9: "RATE_LIMITED",
+	36: "ACCOUNT_RISK",
+	121: "INVALID_PARAM",
+}
+
+# 端点路径片段 → 已知端点漂移场景。
+# #217：fastReply/sendReplyMsg 的 121 已由 qianjunye 抓包确认迁移到 WS+Protobuf。
+# #472：view/geek/info 对简历详情固定返回「旧简历接口已下线」。
+_SEND_REPLY_FRAGMENT = "fastReply/sendReplyMsg"
+_VIEW_GEEK_FRAGMENT = "zpjob/view/geek/info"
+_VIEW_GEEK_RETIRED_MESSAGE = "旧简历接口已下线"
+_ISSUE_217 = "https://github.com/can4hou6joeng4/boss-agent-cli/issues/217"
+_ISSUE_472 = "https://github.com/can4hou6joeng4/boss-agent-cli/issues/472"
+
+
+def _endpoint_hint(response: dict[str, Any]) -> str:
+	hint = response.get("__cli_endpoint_hint__")
+	return hint if isinstance(hint, str) else ""
+
+
+def _view_geek_retired(response: dict[str, Any]) -> bool:
+	return _VIEW_GEEK_FRAGMENT in _endpoint_hint(response) and _VIEW_GEEK_RETIRED_MESSAGE in response_message(response)
+
+
+def _remember_deprecated_endpoint(response: dict[str, Any], tracking_issue: str) -> None:
+	response["__cli_error_details__"] = {
+		"endpoint": _endpoint_hint(response) or None,
+		"tracking_issue": tracking_issue,
+	}
+
+
+def _greet_business_error(response: dict[str, Any]) -> tuple[str, str] | None:
+	"""首次开聊的 code=0 也可能只是成功返回权益拦截页。"""
+	if response.get("code") != 0 or response.get("__cli_endpoint_hint__") != BOSS_CHAT_START_URL:
+		return None
+	data = response.get("zpData")
+	if not isinstance(data, dict) or type(data.get("chat")) is not int or data["chat"] != 0:
+		return None
+	title = data.get("limitTitle")
+	if type(data.get("status")) is int and data["status"] == 3 and isinstance(title, str) and title.strip():
+		description = data.get("stateDesc") or data.get("stateDes")
+		return "GREET_LIMIT", f"{title}；{description}" if isinstance(description, str) and description else title
+	return "GREET_RESULT_UNKNOWN", "平台返回未开聊状态，未确认首次招呼成功"
+
+
+class BossRecruiterPlatform(RecruiterPlatform):
+	"""BOSS 直聘招聘者平台实现。"""
+
+	name = "zhipin-recruiter"
+	display_name = "BOSS 直聘（招聘者）"
+	base_url = BASE_URL
+
+	def __init__(self, client: "BossRecruiterClient") -> None:
+		super().__init__(client)
+		self._client: "BossRecruiterClient" = client
+
+	# ── 包络适配 ────────────────────────────────────────
+
+	def is_success(self, response: dict[str, Any]) -> bool:
+		if _view_geek_retired(response):
+			return False
+		return response.get("code") == 0 and _greet_business_error(response) is None
+
+	def unwrap_data(self, response: dict[str, Any]) -> Any:
+		return response.get("zpData")
+
+	def parse_error(self, response: dict[str, Any]) -> tuple[str, str]:
+		greet_error = _greet_business_error(response)
+		if greet_error is not None:
+			return greet_error
+		code = response.get("code")
+		message = response_message(response)
+		if code in (CODE_IP_RESTRICTED, str(CODE_IP_RESTRICTED)):
+			return "ENVIRONMENT_RISK", message
+		if code in (CODE_ACCOUNT_RESTRICTED, str(CODE_ACCOUNT_RESTRICTED), 35, "35", 36, "36"):
+			return "ACCOUNT_RISK", message
+		if code in (CODE_STOKEN_EXPIRED, str(CODE_STOKEN_EXPIRED)):
+			unified = "TOKEN_REFRESH_FAILED" if classify_code_37(response) == "token_expired" else "ENVIRONMENT_RISK"
+			return unified, message
+		# 客户端自己判定的结果状态（例如 ACTION_UNCONFIRMED）放在 CLI 内部命名空间字段里。
+		cli_code = response.get("__cli_error_code__")
+		if isinstance(cli_code, str) and cli_code:
+			return cli_code, message
+		if _view_geek_retired(response):
+			_remember_deprecated_endpoint(response, _ISSUE_472)
+			return "ENDPOINT_DEPRECATED", message
+		unified = _ERROR_CODE_MAP.get(code, "UNKNOWN") if isinstance(code, int) else "UNKNOWN"
+		# 端点漂移场景下重映射 121：调用方（_browser_request / _request）在 response dict 注入
+		# __cli_endpoint_hint__ 字段（CLI 内部命名空间，避免与服务端字段冲突）。
+		if code == 121 and _SEND_REPLY_FRAGMENT in _endpoint_hint(response):
+			_remember_deprecated_endpoint(response, _ISSUE_217)
+			unified = "ENDPOINT_DEPRECATED"
+		return unified, message
+
+	# ── 候选人列表与筛选 ────────────────────────────────
+
+	def friend_list(self, page: int = 1, label_id: int = 0, job_id: str | None = None) -> dict[str, Any]:
+		return self._client.friend_list(page=page, label_id=label_id, job_id=job_id)
+
+	def friend_detail(self, friend_ids: list[int]) -> dict[str, Any]:
+		return self._client.friend_detail(friend_ids)
+
+	def friend_labels(self) -> dict[str, Any]:
+		return self._client.friend_labels()
+
+	def greet_list(self, page: int = 1, job_id: str | None = None) -> dict[str, Any]:
+		return self._client.greet_list(page=page, job_id=job_id)
+
+	def greet_rec_list(self, page: int = 1, job_id: str | None = None) -> dict[str, Any]:
+		return self._client.greet_rec_list(page=page, job_id=job_id)
+
+	def recommend_geeks(self, job_id: str, page: int = 1) -> dict[str, Any]:
+		return self._client.recommend_geeks(job_id, page=page)
+
+	def start_chat(self, *, geek_id: str, job_id: str, expect_id: str, lid: str, security_id: str, message: str, suid: str = "") -> dict[str, Any]:
+		return self._client.start_chat(
+			geek_id=geek_id,
+			job_id=job_id,
+			expect_id=expect_id,
+			lid=lid,
+			security_id=security_id,
+			message=message,
+			suid=suid,
+		)
+
+	# ── 候选人搜索与简历 ────────────────────────────────
+
+	def search_geeks(
+		self,
+		query: str,
+		*,
+		city: str | None = None,
+		page: int = 1,
+		job_id: str | None = None,
+		experience: str | None = None,
+		degree: str | None = None,
+		age: str | None = None,
+		school_level: str | None = None,
+		activeness: str | None = None,
+		source: str | None = None,
+		select: bool = False,
+		salary: str | None = None,
+	) -> dict[str, Any]:
+		return self._client.search_geeks(
+			query,
+			city=city,
+			page=page,
+			job_id=job_id,
+			experience=experience,
+			degree=degree,
+			age=age,
+			school_level=school_level,
+			activeness=activeness,
+			source=source,
+			select=select,
+			salary=salary,
+		)
+
+	def view_geek(self, geek_id: str, job_id: str, security_id: str | None = None) -> dict[str, Any]:
+		return self._client.view_geek(geek_id, job_id=job_id, security_id=security_id)
+
+	def chat_geek_info(self, uid: str, security_id: str, geek_source: int | None = None) -> dict[str, Any]:
+		return self._client.chat_geek_info(uid, security_id, geek_source)
+
+	# ── 消息 / 聊天 ──────────────────────────────────────
+
+	def chat_list_snapshot(self) -> dict[str, Any] | None:
+		return self._client.chat_list_snapshot()
+
+	def last_messages(self, friend_ids: list[int], *, src: int = 0) -> dict[str, Any]:
+		return self._client.last_messages(friend_ids, src=src)
+
+	def chat_history(self, gid: int, *, count: int = 20, max_msg_id: int | None = None) -> dict[str, Any]:
+		return self._client.chat_history(gid, count=count, max_msg_id=max_msg_id)
+
+	def send_message(self, gid: int, content: str) -> dict[str, Any]:
+		return self._client.send_message(gid, content)
+
+	def send_message_by_friend(self, friend_id: int, content: str) -> dict[str, Any]:
+		return self._client.send_message_by_friend(friend_id, content)
+
+	def session_enter(self, geek_id: str, expect_id: str, job_id: str, security_id: str) -> dict[str, Any]:
+		return self._client.session_enter(geek_id, expect_id, job_id, security_id)
+
+	# ── 职位管理 ──────────────────────────────────────────
+
+	def list_jobs(self, page: int = 1) -> dict[str, Any]:
+		return self._client.list_jobs(page=page)
+
+	def job_offline(self, job_id: str) -> dict[str, Any]:
+		return self._client.job_offline(job_id)
+
+	def job_online(self, job_id: str) -> dict[str, Any]:
+		return self._client.job_online(job_id)
+
+	def job_detail(self, enc_job_id: str) -> dict[str, Any]:
+		return self._client.job_detail(enc_job_id)
+
+	# ── 交换联系方式 ──────────────────────────────────────
+
+	def exchange_request(self, exchange_type: int, uid: int, job_id: int, gid: int) -> dict[str, Any]:
+		return self._client.exchange_request(exchange_type, uid, job_id, gid)
+
+	def exchange_request_by_friend(self, friend_id: int, exchange_type: int) -> dict[str, Any]:
+		return self._client.exchange_request_by_friend(friend_id, exchange_type)
+
+	def accept_resume_by_friend(self, friend_id: int, message_id: int) -> dict[str, Any]:
+		return self._client.accept_resume_by_friend(friend_id, message_id)
+
+	def exchange_content(self, uid: int) -> dict[str, Any]:
+		return self._client.exchange_content(uid)
+
+	def download_resume_by_friend(self, friend_id: int, message_id: int, output: Path) -> dict[str, Any]:
+		return self._client.download_resume_by_friend(friend_id, message_id, output)
+
+	# ── 面试 ──────────────────────────────────────────────
+
+	def interview_list(self) -> dict[str, Any]:
+		return self._client.interview_list()
+
+	def interview_invite(self, geek_id: str, job_id: str, security_id: str, **kwargs: Any) -> dict[str, Any]:
+		return self._client.interview_invite(geek_id, job_id, security_id, **kwargs)
+
+	# ── 候选人操作 ────────────────────────────────────────
+
+	def mark_unsuitable(self, geek_id: str, job_id: str) -> dict[str, Any]:
+		return self._client.mark_unsuitable(geek_id, job_id)
